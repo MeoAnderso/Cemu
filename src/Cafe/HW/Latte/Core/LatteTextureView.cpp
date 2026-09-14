@@ -4,6 +4,58 @@
 #include "LatteCachedFBO.h"
 #include "Cafe/GraphicPack/GraphicPack2.h"
 
+// See LatteTextureView.h. Every case here is a format whose guest channel order and host channel
+// order disagree, so the guest's component select has to be remapped rather than used verbatim
+uint32 LatteTextureView_AdjustTextureCompSel(Latte::E_GX2SURFFMT format, uint32 compSel)
+{
+	switch (format)
+	{
+	case Latte::E_GX2SURFFMT::R8_UNORM: // R8 is replicated on all channels (while OpenGL would return 1.0 for BGA instead)
+	case Latte::E_GX2SURFFMT::R8_SNORM: // probably the same as _UNORM, but needs testing
+		if (compSel >= 1 && compSel <= 3)
+			compSel = 0;
+		break;
+	case Latte::E_GX2SURFFMT::A1_B5_G5_R5_UNORM: // order of components is reversed (RGBA -> ABGR)
+		if (compSel >= 0 && compSel <= 3)
+			compSel = 3 - compSel;
+		break;
+	case Latte::E_GX2SURFFMT::BC4_UNORM:
+	case Latte::E_GX2SURFFMT::BC4_SNORM:
+		if (compSel >= 1 && compSel <= 3)
+			compSel = 0;
+		break;
+	case Latte::E_GX2SURFFMT::BC5_UNORM:
+	case Latte::E_GX2SURFFMT::BC5_SNORM:
+		// RG maps to RG
+		// B maps to ?
+		// A maps to G (guessed)
+		if (compSel == 3)
+			compSel = 1; // read Alpha as Green
+		break;
+	case Latte::E_GX2SURFFMT::A2_B10_G10_R10_UNORM:
+		// reverse components (Wii U: ABGR, OpenGL: RGBA)
+		// used in Resident Evil Revelations
+		if (compSel >= 0 && compSel <= 3)
+			compSel = 3 - compSel;
+		break;
+	case Latte::E_GX2SURFFMT::X24_G8_UINT:
+		// map everything to alpha?
+		if (compSel >= 0 && compSel <= 3)
+			compSel = 3;
+		break;
+	case Latte::E_GX2SURFFMT::R4_G4_UNORM:
+		// red and green swapped
+		if (compSel == 0)
+			compSel = 1;
+		else if (compSel == 1)
+			compSel = 0;
+		break;
+	default:
+		break;
+	}
+	return compSel;
+}
+
 LatteTextureView::LatteTextureView(LatteTexture* texture, sint32 firstMip, sint32 mipCount, sint32 firstSlice, sint32 sliceCount, Latte::E_DIM dim, Latte::E_GX2SURFFMT format, bool registerView)
 {
 	this->baseTexture = texture;

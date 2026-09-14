@@ -1,5 +1,16 @@
 #pragma once
 
+// Maps one guest texture component select (the DST_SEL fields of SQ_TEX_RESOURCE_WORD4) onto the
+// component the host pixel format actually stores. Only the formats whose guest and native channel
+// orders differ need this: the reversed 16-bit formats, the single/dual channel formats, packed
+// A1_B5_G5_R5, and depth-as-RGBA.
+//
+// Shared by the Vulkan and Metal backends, which apply the result to an image view's
+// VkComponentMapping and a texture view's MTLTextureSwizzleChannels respectively. Keeping one copy
+// is the point: the two backends must agree on the channel order or the same game renders
+// differently on each.
+uint32 LatteTextureView_AdjustTextureCompSel(Latte::E_GX2SURFFMT format, uint32 compSel);
+
 class LatteTextureView
 {
 public:

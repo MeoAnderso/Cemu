@@ -4,56 +4,6 @@
 #include "Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h"
 #include "Cafe/HW/Latte/Core/LattePerformanceMonitor.h"
 
-uint32 LatteTextureVk_AdjustTextureCompSel(Latte::E_GX2SURFFMT format, uint32 compSel)
-{
-	switch (format)
-	{
-	case Latte::E_GX2SURFFMT::R8_UNORM: // R8 is replicated on all channels (while OpenGL would return 1.0 for BGA instead)
-	case Latte::E_GX2SURFFMT::R8_SNORM: // probably the same as _UNORM, but needs testing
-		if (compSel >= 1 && compSel <= 3)
-			compSel = 0;
-		break;
-	case Latte::E_GX2SURFFMT::A1_B5_G5_R5_UNORM: // order of components is reversed (RGBA -> ABGR)
-		if (compSel >= 0 && compSel <= 3)
-			compSel = 3 - compSel;
-		break;
-	case Latte::E_GX2SURFFMT::BC4_UNORM:
-	case Latte::E_GX2SURFFMT::BC4_SNORM:
-		if (compSel >= 1 && compSel <= 3)
-			compSel = 0;
-		break;
-	case Latte::E_GX2SURFFMT::BC5_UNORM:
-	case Latte::E_GX2SURFFMT::BC5_SNORM:
-		// RG maps to RG
-		// B maps to ?
-		// A maps to G (guessed)
-		if (compSel == 3)
-			compSel = 1; // read Alpha as Green
-		break;
-	case Latte::E_GX2SURFFMT::A2_B10_G10_R10_UNORM:
-		// reverse components (Wii U: ABGR, OpenGL: RGBA)
-		// used in Resident Evil Revelations
-		if (compSel >= 0 && compSel <= 3)
-			compSel = 3 - compSel;
-		break;
-	case Latte::E_GX2SURFFMT::X24_G8_UINT:
-		// map everything to alpha?
-		if (compSel >= 0 && compSel <= 3)
-			compSel = 3;
-		break;
-	case Latte::E_GX2SURFFMT::R4_G4_UNORM:
-		// red and green swapped
-		if (compSel == 0)
-			compSel = 1;
-		else if (compSel == 1)
-			compSel = 0;
-		break;
-	default:
-		break;
-	}
-	return compSel;
-}
-
 LatteTextureViewVk::LatteTextureViewVk(VkDevice device, LatteTextureVk* texture, Latte::E_DIM dim, Latte::E_GX2SURFFMT format, sint32 firstMip, sint32 mipCount, sint32 firstSlice, sint32 sliceCount)
 	: LatteTextureView(texture, firstMip, mipCount, firstSlice, sliceCount, dim, format), m_device(device)
 {
@@ -98,10 +48,10 @@ VKRObjectTextureView* LatteTextureViewVk::CreateView(uint32 gpuSamplerSwizzle)
 	uint32 compSelG = (gpuSamplerSwizzle >> 19) & 0x7;
 	uint32 compSelB = (gpuSamplerSwizzle >> 22) & 0x7;
 	uint32 compSelA = (gpuSamplerSwizzle >> 25) & 0x7;
-	compSelR = LatteTextureVk_AdjustTextureCompSel(format, compSelR);
-	compSelG = LatteTextureVk_AdjustTextureCompSel(format, compSelG);
-	compSelB = LatteTextureVk_AdjustTextureCompSel(format, compSelB);
-	compSelA = LatteTextureVk_AdjustTextureCompSel(format, compSelA);
+	compSelR = LatteTextureView_AdjustTextureCompSel(format, compSelR);
+	compSelG = LatteTextureView_AdjustTextureCompSel(format, compSelG);
+	compSelB = LatteTextureView_AdjustTextureCompSel(format, compSelB);
+	compSelA = LatteTextureView_AdjustTextureCompSel(format, compSelA);
 
 	VkImageViewCreateInfo viewInfo{};
 	viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
