@@ -9,6 +9,9 @@ bool LatteQueryObjectMtl::getResult(uint64& numSamplesPassed)
     uint64* resultPtr = m_mtlr->GetOcclusionQueryResultsPtr();
 
     numSamplesPassed = 0;
+    if (m_range.begin == m_range.end)
+        return true; // no draws executed inside the query - zero samples passed (also guards the
+                     // degenerate wrap-around case where a query spans the entire pool)
     for (uint32 i = m_range.begin; i != m_range.end; i = (i + 1) % MetalRenderer::OCCLUSION_QUERY_POOL_SIZE)
         numSamplesPassed += resultPtr[i];
 

@@ -14,11 +14,6 @@ public:
 	void begin() override;
 	void end() override;
 
-	void GrowRange()
-	{
-	    m_range.end++;
-	}
-
 private:
 	class MetalRenderer* m_mtlr;
 
