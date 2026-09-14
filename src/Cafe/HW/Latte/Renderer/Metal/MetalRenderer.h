@@ -214,6 +214,7 @@ public:
 
 	bool UseTFViaSSBO() const override { return true; }
 	void AppendOverlayDebugInfo() override;
+	void LogDiagnosticsSummary() override;
 
 	// rendertarget
 	void renderTarget_setViewport(float x, float y, float width, float height, float nearZ, float farZ, bool halfZ = false) override;

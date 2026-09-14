@@ -98,6 +98,14 @@ const char* MetalDiag_GetName(MetalDiagEvent event)
 	return kDescriptors[index].name;
 }
 
+uint32 MetalDiag_GetCount(MetalDiagEvent event)
+{
+	const size_t index = (size_t)event;
+	if (index >= (size_t)MetalDiagEvent::COUNT)
+		return 0;
+	return g_eventCounts[index].load(std::memory_order_relaxed);
+}
+
 bool MetalDiag_MarkFirstSighting(MetalDiagEvent event, uintptr_t key)
 {
 	std::lock_guard<std::mutex> lock(g_firstSightingMutex);

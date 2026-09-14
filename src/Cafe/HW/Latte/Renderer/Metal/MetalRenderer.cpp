@@ -903,6 +903,29 @@ void MetalRenderer::AppendOverlayDebugInfo()
 	ImGui::Text("Index");
 	ImGui::SameLine(60.0f);
 	ImGui::Text("%06uKB / %06uKB Buffers: %u", ((uint32)(totalSize - freeSize) + 1023) / 1024, ((uint32)totalSize + 1023) / 1024, (uint32)numBuffers);
+
+	// Session fallback census. Shown here so it is visible live: the shutdown summary is the only
+	// other channel and it is lost to anything but a graceful quit (SIGTERM is a bare _Exit).
+	// Names come from the same descriptors the summary prints, so the two cannot disagree.
+	ImGui::Text("--- Backend fallbacks (session) ---");
+	{
+		uint32 shown = 0;
+		for (uint32 i = 0; i < (uint32)MetalDiagEvent::COUNT; i++)
+		{
+			const uint32 count = MetalDiag_GetCount((MetalDiagEvent)i);
+			if (count == 0)
+				continue;
+			ImGui::Text("%7u  %s", count, MetalDiag_GetName((MetalDiagEvent)i));
+			shown++;
+		}
+		if (shown == 0)
+			ImGui::Text("none recorded");
+	}
+}
+
+void MetalRenderer::LogDiagnosticsSummary()
+{
+	MetalDiag_LogSummary();
 }
 
 void MetalRenderer::renderTarget_setViewport(float x, float y, float width, float height, float nearZ, float farZ, bool halfZ)

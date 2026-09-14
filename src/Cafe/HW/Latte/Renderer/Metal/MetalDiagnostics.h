@@ -69,6 +69,11 @@ uint32 MetalDiag_Record(MetalDiagEvent event);
 
 const char* MetalDiag_GetName(MetalDiagEvent event);
 
+// Occurrences recorded for one event since startup. Lets the OSD panel show the census live, so the
+// shutdown summary stops being the only way to see it - that one is lost to anything but a graceful
+// quit, since Cemu's SIGTERM handler is a bare _Exit.
+uint32 MetalDiag_GetCount(MetalDiagEvent event);
+
 // Records one occurrence, attaching `detail` (shader hash, texture address, format...) to the
 // verbose channel. Prefer this overload where something identifying is at hand: the summary says
 // which class of fallback is happening, the detail says for which shader or texture.
