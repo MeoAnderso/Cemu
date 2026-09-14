@@ -17,6 +17,7 @@
 .idea/
 
 build/
+build-xcode/
 cmake-build-*/
 out/
 .cache/
