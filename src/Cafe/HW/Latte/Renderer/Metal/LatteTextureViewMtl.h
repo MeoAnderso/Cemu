@@ -5,7 +5,6 @@
 
 #include "Cafe/HW/Latte/Core/LatteTexture.h"
 
-#define RGBA_SWIZZLE 0x06880000
 #define INVALID_SWIZZLE 0xFFFFFFFF
 
 // Cache key for renderer-side per-texture sample views derived from a bound LatteTextureView
@@ -31,8 +30,18 @@ template<> struct hash<LatteMtlSampleViewKey>
 {
 	size_t operator()(const LatteMtlSampleViewKey& k) const
 	{
-		return (size_t)k.swizzle ^ ((size_t)k.format << 32) ^ ((size_t)k.dim << 48) ^
-			((size_t)k.firstMip << 8) ^ ((size_t)k.numMip << 16) ^ ((size_t)k.firstSlice << 24) ^ ((size_t)k.numSlice << 56);
+		// The fields need 79 bits in total (swizzle 12, format 16, dim 3, mips 8+8, slices 16+16),
+		// so no assignment of disjoint bit ranges within a 64-bit value exists. An earlier version
+		// shifted the fields into overlapping ranges and pushed numSlice off the top of size_t.
+		// Fold each field in whole instead. Equality is still decided by the defaulted operator==,
+		// so this only has to spread the buckets, not be injective
+		size_t h = (size_t)k.swizzle;
+		for (const size_t field : { (size_t)k.format, (size_t)k.dim, (size_t)k.firstMip,
+			(size_t)k.numMip, (size_t)k.firstSlice, (size_t)k.numSlice })
+		{
+			h ^= field + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+		}
+		return h;
 	}
 };
 }

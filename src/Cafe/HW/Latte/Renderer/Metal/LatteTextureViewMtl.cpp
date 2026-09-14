@@ -5,56 +5,6 @@
 #include "Metal/MTLTexture.hpp"
 #include <atomic>
 
-uint32 LatteTextureMtl_AdjustTextureCompSel(Latte::E_GX2SURFFMT format, uint32 compSel)
-{
-	switch (format)
-	{
-	case Latte::E_GX2SURFFMT::R8_UNORM: // R8 is replicated on all channels (while OpenGL would return 1.0 for BGA instead)
-	case Latte::E_GX2SURFFMT::R8_SNORM: // probably the same as _UNORM, but needs testing
-		if (compSel >= 1 && compSel <= 3)
-			compSel = 0;
-		break;
-	case Latte::E_GX2SURFFMT::A1_B5_G5_R5_UNORM: // order of components is reversed (RGBA -> ABGR)
-		if (compSel >= 0 && compSel <= 3)
-			compSel = 3 - compSel;
-		break;
-	case Latte::E_GX2SURFFMT::BC4_UNORM:
-	case Latte::E_GX2SURFFMT::BC4_SNORM:
-		if (compSel >= 1 && compSel <= 3)
-			compSel = 0;
-		break;
-	case Latte::E_GX2SURFFMT::BC5_UNORM:
-	case Latte::E_GX2SURFFMT::BC5_SNORM:
-		// RG maps to RG
-		// B maps to ?
-		// A maps to G (guessed)
-		if (compSel == 3)
-			compSel = 1; // read Alpha as Green
-		break;
-	case Latte::E_GX2SURFFMT::A2_B10_G10_R10_UNORM:
-		// reverse components (Wii U: ABGR, OpenGL: RGBA)
-		// used in Resident Evil Revelations
-		if (compSel >= 0 && compSel <= 3)
-			compSel = 3 - compSel;
-		break;
-	case Latte::E_GX2SURFFMT::X24_G8_UINT:
-		// map everything to alpha?
-		if (compSel >= 0 && compSel <= 3)
-			compSel = 3;
-		break;
-	case Latte::E_GX2SURFFMT::R4_G4_UNORM:
-		// red and green swapped
-		if (compSel == 0)
-			compSel = 1;
-		else if (compSel == 1)
-			compSel = 0;
-		break;
-	default:
-		break;
-	}
-	return compSel;
-}
-
 LatteTextureViewMtl::LatteTextureViewMtl(MetalRenderer* mtlRenderer, LatteTextureMtl* texture, Latte::E_DIM dim, Latte::E_GX2SURFFMT format, sint32 firstMip, sint32 mipCount, sint32 firstSlice, sint32 sliceCount)
 	: LatteTextureView(texture, firstMip, mipCount, firstSlice, sliceCount, dim, format), m_mtlr(mtlRenderer), m_baseTexture(texture)
 {
@@ -130,10 +80,10 @@ MTL::TextureSwizzleChannels LatteTextureViewMtl::GetSwizzleChannels(Latte::E_GX2
 	uint32 compSelG = (gpuSamplerSwizzle >> 19) & 0x7;
 	uint32 compSelB = (gpuSamplerSwizzle >> 22) & 0x7;
 	uint32 compSelA = (gpuSamplerSwizzle >> 25) & 0x7;
-	compSelR = LatteTextureMtl_AdjustTextureCompSel(format, compSelR);
-	compSelG = LatteTextureMtl_AdjustTextureCompSel(format, compSelG);
-	compSelB = LatteTextureMtl_AdjustTextureCompSel(format, compSelB);
-	compSelA = LatteTextureMtl_AdjustTextureCompSel(format, compSelA);
+	compSelR = LatteTextureView_AdjustTextureCompSel(format, compSelR);
+	compSelG = LatteTextureView_AdjustTextureCompSel(format, compSelG);
+	compSelB = LatteTextureView_AdjustTextureCompSel(format, compSelB);
+	compSelA = LatteTextureView_AdjustTextureCompSel(format, compSelA);
 
 	MTL::TextureSwizzleChannels swizzle;
 	swizzle.red = GetMtlTextureSwizzle(compSelR);
@@ -215,8 +165,12 @@ MTL::Texture* LatteTextureViewMtl::CreateViewInternal(const MTL::TextureSwizzleC
             layerCount = this->numSlice;
     }
 
-    // Clamp mip levels
-    levelCount = std::min(levelCount, m_baseTexture->maxPossibleMipLevels - baseLevel);
+    // Clamp mip levels. Done in signed arithmetic so a baseLevel past the end of the chain cannot
+    // wrap the subtraction into a huge levelCount and ask Metal for mip levels the texture does not
+    // have. firstMip < mipLevels <= maxPossibleMipLevels holds today (LatteTextureMtl::CreateView
+    // asserts the first half in debug builds) - this only keeps the failure benign if that changes
+    const sint32 availableLevels = std::max<sint32>(m_baseTexture->maxPossibleMipLevels - (sint32)baseLevel, 0);
+    levelCount = std::min<uint32>(levelCount, (uint32)availableLevels);
     levelCount = std::max(levelCount, (uint32)1);
 
     auto pixelFormat = GetMtlPixelFormat(format, m_baseTexture->isDepth);
