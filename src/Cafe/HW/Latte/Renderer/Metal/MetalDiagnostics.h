@@ -41,7 +41,11 @@ enum class MetalDiagEvent : uint8
 	// Pipeline state
 	PipelineCompileFailedPermanent,  // compilation cannot succeed, draws are skipped from now on
 
-	// Texture and surface handling
+	// Draw availability. The mesh path is Metal's only geometry-shader emulation, and RECTS rides
+	// the same path (UseGeometryShader is hasGeometryShader || UseRectEmulation), so a device with
+	// no mesh shader support has no route for these draws at all and they are dropped.
+	GeometryShaderUnsupported,       // geometry shader / RECTS draw skipped - no mesh shader support
+
 	DepthMirrorUnavailable,          // depth-as-data read has no mirror on this backend
 	FeedbackLoopUnsupported,         // texture sampled while attached, no shadow copy possible
 	// The next three are Metal's handling of sampled mip chains. The first two are the backend's

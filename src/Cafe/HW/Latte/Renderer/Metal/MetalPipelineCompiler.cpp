@@ -294,7 +294,21 @@ void MetalPipelineCompiler::InitFromState(const LatteFetchShader* fetchShader, c
 {
     m_usesGeometryShader = UseGeometryShader(lcr, geometryShader != nullptr);
     if (m_usesGeometryShader && !m_mtlr->SupportsMeshShaders())
+    {
+        // The same condition the draw path reports as GeometryShaderUnsupported, reached instead from
+        // pipeline construction: the pipeline-cache loader replays a cache written on a mesh-capable
+        // machine, and the old silent return surfaced only as "Failed to compile pipeline restored
+        // from cache, skipping" while the census stayed empty for a loss it exists to name.
+        // Reported here and not in Compile(), which tests the same condition on the same compiler -
+        // reporting in both would count one pipeline twice
+        MetalDiag_CountOncePer(MetalDiagEvent::GeometryShaderUnsupported,
+            (uintptr_t)(geometryShader ? geometryShader->baseHash : 0),
+            "geometry shader {:016x}_{:016x}{} cannot be built - no mesh shader support on this device",
+            geometryShader ? geometryShader->baseHash : 0ull,
+            geometryShader ? geometryShader->auxHash : 0ull,
+            geometryShader ? "" : " (RECTS emulation)");
         return;
+    }
 
     // Rasterization
 	m_rasterizationEnabled = lcr.IsRasterizationEnabled();
@@ -330,6 +344,7 @@ bool MetalPipelineCompiler::Compile(bool forceCompile, bool isRenderThread, bool
     // exactly this reason (an imbalance there crashes at thread exit)
     NS_STACK_SCOPED NS::AutoreleasePool* autoreleasePool = NS::AutoreleasePool::alloc()->init();
 
+    // already reported by InitFromState, which tests the same condition on this compiler
     if (m_usesGeometryShader && !m_mtlr->SupportsMeshShaders())
         return false;
 

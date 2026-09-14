@@ -42,6 +42,10 @@ namespace
 
 		{ "render pipeline compilation failed permanently",
 		  "draws using this pipeline are skipped for the rest of the session" },
+		// Counts two sites: the draw path skipping a draw, and pipeline construction failing before a
+		// draw could be reached (a pipeline cache replayed on a device without mesh shaders)
+		{ "geometry shader / RECTS work could not be served (no mesh shader support on this device)",
+		  "every draw needing geometry-shader or RECTS emulation is missing on this GPU" },
 
 		{ "depth-as-data reads served without a depth mirror",
 		  "effects reading depth may be wrong or blank" },

@@ -2373,7 +2373,20 @@ void MetalRenderer::draw_execute(uint32 baseVertex, uint32 baseInstance, uint32 
 
     bool usesGeometryShader = UseGeometryShader(LatteGPUState.contextNew, geometryShader != nullptr);
     if (usesGeometryShader && !m_supportsMeshShaders)
+    {
+        // The mesh path is Metal's only geometry-shader emulation, and RECTS rides the same path
+        // (UseGeometryShader is hasGeometryShader || UseRectEmulation) - so on a device without
+        // mesh shader support there is no route for this draw and it is dropped. Report it: the
+        // skip used to be silent in the frame and in the log, which made "geometry is missing here"
+        // indistinguishable from a game that simply draws nothing.
+        MetalDiag_CountOncePer(MetalDiagEvent::GeometryShaderUnsupported,
+            (uintptr_t)(geometryShader ? geometryShader->baseHash : 0),
+            "geometry shader {:016x}_{:016x}{} skipped - no mesh shader support on this device",
+            geometryShader ? geometryShader->baseHash : 0ull,
+            geometryShader ? geometryShader->auxHash : 0ull,
+            geometryShader ? "" : " (RECTS emulation)");
         return;
+    }
 
     bool fetchVertexManually = (usesGeometryShader || fetchShader->mtlFetchVertexManually);
 
