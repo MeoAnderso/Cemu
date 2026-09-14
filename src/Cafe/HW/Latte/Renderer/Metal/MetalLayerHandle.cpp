@@ -15,6 +15,8 @@ MetalLayerHandle::MetalLayerHandle(MTL::Device* device, const Vector2i& size, bo
 
 MetalLayerHandle::~MetalLayerHandle()
 {
+    if (m_drawable)
+        m_drawable->release();
     if (m_layer)
         m_layer->release();
 }
@@ -36,11 +38,15 @@ bool MetalLayerHandle::AcquireDrawable()
         return false;
     }
 
+    // nextDrawable returns an autoreleased object - hold an explicit reference so the drawable
+    // survives the render thread's per-frame autorelease pool drain (drained after present)
+    m_drawable->retain();
     return true;
 }
 
 void MetalLayerHandle::PresentDrawable(MTL::CommandBuffer* commandBuffer)
 {
     commandBuffer->presentDrawable(m_drawable);
+    m_drawable->release();
     m_drawable = nullptr;
 }
