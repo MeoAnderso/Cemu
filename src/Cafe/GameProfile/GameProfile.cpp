@@ -221,7 +221,11 @@ bool GameProfile::Load(uint64_t title_id)
 		else if (boost::iequals(iniParser.GetCurrentSectionName(), "Graphics"))
 		{
 			gameProfileIntegerOption_t graphicsApi;
-			gameProfile_loadIntegerOption(&iniParser, "graphics_api", &graphicsApi, -1, 0, 1);
+			// accept the full GraphicAPI enum range (0=OpenGL, 1=Vulkan, 2=Metal). The range
+			// still ended at 1 after Metal was added, so the backend value the emulator writes
+			// back on exit (2) was rejected as out of range on the next load and silently
+			// fell back to the build default
+			gameProfile_loadIntegerOption(&iniParser, "graphics_api", &graphicsApi, -1, 0, (int)GraphicAPI::COUNT - 1);
 			if (graphicsApi.value != -1)
 				m_graphics_api = (GraphicAPI)graphicsApi.value;
 
