@@ -95,6 +95,11 @@ public:
 	virtual bool UseTFViaSSBO() const { return false; }
 	virtual void AppendOverlayDebugInfo() = 0;
 
+	// One-block session census of the backend fallbacks that degrade rendering, called from
+	// LatteThread_Exit. Defaulted to a no-op: only the Metal backend keeps such a census, and this
+	// keeps the call site in shared Core code free of a backend-specific include.
+	virtual void LogDiagnosticsSummary() {}
+
 	// rendertarget
 	virtual void renderTarget_setViewport(float x, float y, float width, float height, float nearZ, float farZ, bool halfZ = false) = 0;
 	virtual void renderTarget_setScissor(sint32 scissorX, sint32 scissorY, sint32 scissorWidth, sint32 scissorHeight) = 0;

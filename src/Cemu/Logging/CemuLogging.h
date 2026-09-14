@@ -39,6 +39,7 @@ enum class LogType : sint32
 	NN_SL = 26,
 
 	TextureReadback = 29,
+	MetalBackend = 30, // Metal renderer diagnostics and unsupported-feature fallbacks
 	ProcUi = 39,
 	nlibcurl = 41,
 	SWKBD = 45,

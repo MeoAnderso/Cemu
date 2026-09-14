@@ -580,6 +580,8 @@ if(ENABLE_METAL)
         HW/Latte/Renderer/Metal/MetalCppImpl.cpp
         HW/Latte/Renderer/Metal/MetalDepthStencilCache.cpp
         HW/Latte/Renderer/Metal/MetalDepthStencilCache.h
+        HW/Latte/Renderer/Metal/MetalDiagnostics.cpp
+        HW/Latte/Renderer/Metal/MetalDiagnostics.h
         HW/Latte/Renderer/Metal/MetalLayer.h
         HW/Latte/Renderer/Metal/MetalLayer.mm
         HW/Latte/Renderer/Metal/MetalLayerHandle.cpp
