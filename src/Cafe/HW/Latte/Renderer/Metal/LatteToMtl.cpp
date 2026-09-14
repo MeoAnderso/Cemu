@@ -177,21 +177,51 @@ void CheckForPixelFormatSupport(const MetalPixelFormatSupport& support)
 
     if (!support.m_supportsDepth24Unorm_Stencil8)
     {
-        // Depth24Unorm_Stencil8
+        // Depth24Unorm_Stencil8 (all Apple silicon GPUs) - swap to Depth32Float_Stencil8 like
+        // Vulkan's fallback (VulkanRenderer::GetTextureFormatInfoVK). Vulkan skips the CPU upload
+        // entirely for this fallback (TextureDecoder_NullData64 zeroes the slices), so the
+        // packed-D24S8 upload-stride question never arises - game-rendered depth is unaffected,
+        // only game-uploaded depth data reads as cleared, identical to the Vulkan reference.
+        // bytesPerBlock must describe the only copy left: the BlitOptionDepthFromDepthStencil
+        // readback, which writes the depth aspect alone (4 bytes/texel). Metal requires
+        // bytesPerRow to be a multiple of the aspect's texel size, so the old 5-byte stride
+        // (4 depth + 1 stencil) failed validation for widths not divisible by 4 (e.g. 854x480)
+        // and the copy was silently aborted - staging the stale readback content it was meant
+        // to prevent
         MTL_DEPTH_FORMAT_TABLE[Latte::E_GX2SURFFMT::D24_S8_UNORM].pixelFormat = MTL::PixelFormatDepth32Float_Stencil8;
         MTL_DEPTH_FORMAT_TABLE[Latte::E_GX2SURFFMT::D24_S8_UNORM].isAlternateFormat = true;
-        // TODO: implement the decoder
+        // bytesPerBlock here describes the BlitOptionDepthFromDepthStencil readback stride (4 bytes
+        // per texel for the depth aspect alone), not the decoder's staging stride. NB:
+        // isAlternateFormat makes texture_createReadback() refuse this format outright, so the
+        // readback this value was corrected for is currently unreachable - it is kept so the stride
+        // is already right if that refusal is ever relaxed. The upload path uses the decoder below
+        // (NullData64, 8 bytes/texel), so this field carries two meanings at once and wants
+        // splitting into staging/readback strides
+        MTL_DEPTH_FORMAT_TABLE[Latte::E_GX2SURFFMT::D24_S8_UNORM].bytesPerBlock = 4;
+        // Vulkan picks TextureDecoder_NullData64 for the same fallback (VulkanRenderer), i.e. the
+        // surface reads as cleared. A real D24_S8 -> D32_S8 conversion decoder would preserve
+        // game-uploaded depth instead:
         //MTL_DEPTH_FORMAT_TABLE[Latte::E_GX2SURFFMT::D24_S8_UNORM].textureDecoder = TextureDecoder_D24_S8_To_D32_S8::getInstance();
+        MTL_DEPTH_FORMAT_TABLE[Latte::E_GX2SURFFMT::D24_S8_UNORM].textureDecoder = TextureDecoder_NullData64::getInstance();
     }
 }
 
 const MetalPixelFormatInfo GetMtlPixelFormatInfo(Latte::E_GX2SURFFMT format, bool isDepth)
 {
+    // same special case as VulkanRenderer::GetTextureFormatInfoVK: Sonic Transformed (Starry
+    // Speedway) requests R16G16B16A16 with the sRGB bit OR'd onto the float format. There is
+    // no sRGB float representation - treat it as the plain float format (Vulkan parity).
+    // Without this the table lookup misses and silently falls back to R8Unorm
+    if (format == (Latte::E_GX2SURFFMT::R16_G16_B16_A16_FLOAT | Latte::E_GX2SURFFMT::FMT_BIT_SRGB))
+        format = Latte::E_GX2SURFFMT::R16_G16_B16_A16_FLOAT;
     if (isDepth)
     {
         auto it = MTL_DEPTH_FORMAT_TABLE.find(format);
         if (it == MTL_DEPTH_FORMAT_TABLE.end())
-            return {MTL::PixelFormatDepth16Unorm, MetalDataType::NONE, 2, {1, 1}, false, nullptr, true}; // Fallback
+        {
+            cemuLog_logOnce(LogType::Force, "unknown depth texture format {:04x}, falling back to D16Unorm (Vulkan logs the same case as unsupported)", (uint32)format);
+            return {MTL::PixelFormatDepth16Unorm, MetalDataType::NONE, 2, {1, 1}, false, nullptr, true}; // Fallback, isAlternateFormat (format does not match Latte 1:1)
+        }
         else
             return it->second;
     }
@@ -199,7 +229,10 @@ const MetalPixelFormatInfo GetMtlPixelFormatInfo(Latte::E_GX2SURFFMT format, boo
     {
         auto it = MTL_COLOR_FORMAT_TABLE.find(format);
         if (it == MTL_COLOR_FORMAT_TABLE.end())
-            return {MTL::PixelFormatR8Unorm, MetalDataType::FLOAT, 1, {1, 1}, false, nullptr, true}; // Fallback
+        {
+            cemuLog_logOnce(LogType::Force, "unknown color texture format {:04x}, falling back to R8Unorm (Vulkan logs the same case as unsupported)", (uint32)format);
+            return {MTL::PixelFormatR8Unorm, MetalDataType::FLOAT, 1, {1, 1}, false, nullptr, true}; // Fallback, isAlternateFormat (format does not match Latte 1:1)
+        }
         else
             return it->second;
     }
