@@ -914,26 +914,43 @@ void _emitTypeConversionPrefixMSL(LatteDecompilerShaderContext* shaderContext, s
 	if( sourceType == destinationType )
 		return;
 	StringBuf* src = shaderContext->shaderSource;
-	if (destinationType == LATTE_DECOMPILER_DTYPE_SIGNED_INT)
+	// conversion semantics must match the GLSL emitter (_emitTypeConversionPrefix in
+	// LatteDecompilerEmitGLSL.cpp): float<->int are bitcasts, while int<->uint are VALUE
+	// conversions (as_type<int>(uint) would reinterpret the bits instead of converting)
+	if (sourceType == LATTE_DECOMPILER_DTYPE_FLOAT && destinationType == LATTE_DECOMPILER_DTYPE_SIGNED_INT)
 	{
-	    if (componentCount == 1)
+		if (componentCount == 1)
 			src->add("as_type<int>(");
 		else
-            src->addFmt("as_type<int{}>(", componentCount);
+			src->addFmt("as_type<int{}>(", componentCount);
 	}
-	else if (destinationType == LATTE_DECOMPILER_DTYPE_UNSIGNED_INT)
+	else if (sourceType == LATTE_DECOMPILER_DTYPE_FLOAT && destinationType == LATTE_DECOMPILER_DTYPE_UNSIGNED_INT)
 	{
-	    if (componentCount == 1)
+		if (componentCount == 1)
 			src->add("as_type<uint>(");
 		else
-            src->addFmt("as_type<uint{}>(", componentCount);
+			src->addFmt("as_type<uint{}>(", componentCount);
 	}
-	else if (destinationType == LATTE_DECOMPILER_DTYPE_FLOAT)
+	else if (sourceType == LATTE_DECOMPILER_DTYPE_SIGNED_INT && destinationType == LATTE_DECOMPILER_DTYPE_FLOAT)
 	{
-	    if (componentCount == 1)
+		if (componentCount == 1)
 			src->add("as_type<float>(");
 		else
-            src->addFmt("as_type<float{}>(", componentCount);
+			src->addFmt("as_type<float{}>(", componentCount);
+	}
+	else if (sourceType == LATTE_DECOMPILER_DTYPE_UNSIGNED_INT && destinationType == LATTE_DECOMPILER_DTYPE_SIGNED_INT)
+	{
+		if (componentCount == 1)
+			src->add("int(");
+		else
+			src->addFmt("int{}(", componentCount);
+	}
+	else if (sourceType == LATTE_DECOMPILER_DTYPE_SIGNED_INT && destinationType == LATTE_DECOMPILER_DTYPE_UNSIGNED_INT)
+	{
+		if (componentCount == 1)
+			src->add("uint(");
+		else
+			src->addFmt("uint{}(", componentCount);
 	}
 	else
 		cemu_assert_debug(false);
@@ -2182,6 +2199,22 @@ static char* _getTexGPRAccess(LatteDecompilerShaderContext* shaderContext, sint3
 	return tempBuffer;
 }
 
+// Returns the LOD bias of the sampler bound to the given texture unit (0.0 when no sampler is
+// assigned). Metal has no sampler lod-bias property, and its lod clamps also clamp EXPLICIT
+// level() sampling (hardware-verified) - unlike Vulkan's mipLodBias, which never affects
+// explicit-LOD ops. The bias is therefore folded into the emitted LOD expressions here instead
+// of the sampler's clamps. All additions are guarded on bias != 0 so zero-bias samplers (the
+// overwhelming majority) emit byte-identical code
+static float _getSamplerLodBiasMSL(LatteDecompilerShaderContext* shaderContext, uint32 textureIndex)
+{
+	auto stageSamplerIndex = shaderContext->shader->textureUnitSamplerAssignment[textureIndex];
+	if (stageSamplerIndex == LATTE_DECOMPILER_SAMPLER_NONE)
+		return 0.0f;
+	uint32 samplerIndex = stageSamplerIndex + LatteDecompiler_getTextureSamplerBaseIndex(shaderContext->shader->shaderType);
+	sint32 iLodBias = shaderContext->contextRegistersNew->SQ_TEX_SAMPLER[samplerIndex].WORD1.get_LOD_BIAS();
+	return (float)iLodBias / 64.0f;
+}
+
 static void _emitTEXSampleTextureCode(LatteDecompilerShaderContext* shaderContext, LatteDecompilerTEXInstruction* texInstruction)
 {
 	StringBuf* src = shaderContext->shaderSource;
@@ -2195,6 +2228,8 @@ static void _emitTEXSampleTextureCode(LatteDecompilerShaderContext* shaderContex
 
 	char tempBuffer0[32];
 	char tempBuffer1[32];
+	// sampler LOD bias, folded into the emitted LOD expressions (see _getSamplerLodBiasMSL)
+	const float samplerLodBias = _getSamplerLodBiasMSL(shaderContext, texInstruction->textureFetch.textureIndex);
 	src->add(_getRegisterVarName(shaderContext, texInstruction->dstGpr));
 	src->add(".");
 	const char* resultElemTable[4] = {"x","y","z","w"};
@@ -2489,21 +2524,43 @@ static void _emitTEXSampleTextureCode(LatteDecompilerShaderContext* shaderContex
           		    src->add(", ");
          			if (texOpcode == GPU7_TEX_INST_SAMPLE_LB)
          			{
-                        src->addFmt("bias({})", _FormatFloatAsConstant((float)texInstruction->textureFetch.lodBias / 16.0f));
+						// SAMPLE_LB: instruction LOD bias + the sampler's LOD bias (the sampler
+						// bias used to be folded into the sampler clamps, which Metal also
+						// applies to explicit-LOD ops - unlike Vulkan)
+						if (samplerLodBias != 0.0f)
+							src->addFmt("bias({} + {})", _FormatFloatAsConstant((float)texInstruction->textureFetch.lodBias / 16.0f), _FormatFloatAsConstant(samplerLodBias));
+						else
+							src->addFmt("bias({})", _FormatFloatAsConstant((float)texInstruction->textureFetch.lodBias / 16.0f));
          			}
          			else
          			{
          			    // TODO: is this correct?
                         src->add("level(");
         				_emitTEXSampleCoordInputComponent(shaderContext, texInstruction, 3, LATTE_DECOMPILER_DTYPE_FLOAT);
+						if (samplerLodBias != 0.0f)
+							src->addFmt(" + {}", _FormatFloatAsConstant(samplerLodBias));
         				src->add(")");
          			}
           		}
           		else if (texOpcode == GPU7_TEX_INST_SAMPLE_LZ || texOpcode == GPU7_TEX_INST_SAMPLE_C_LZ)
           		{
-         			src->add(", level(0.0)");
+					if (samplerLodBias != 0.0f)
+						src->addFmt(", level({})", _FormatFloatAsConstant(samplerLodBias));
+					else
+         				src->add(", level(0.0)");
           		}
     		}
+			// plain implicit-LOD samples: apply the sampler's LOD bias via bias() (Vulkan applies
+			// mipLodBias to implicit sampling through the sampler; Metal has no sampler bias).
+			// Only the plain sample forms have an MSL overload that takes a bias: gradient2d is
+			// only ever the third argument, the 1D sample() overloads take no lod options at all,
+			// and sampleCompareEmulate has a fixed five-argument signature
+			if (texDim != Latte::E_DIM::DIM_1D && texDim != Latte::E_DIM::DIM_1D_ARRAY &&
+				(texOpcode == GPU7_TEX_INST_SAMPLE || texOpcode == GPU7_TEX_INST_SAMPLE_C) &&
+				!emulateCompare && samplerLodBias != 0.0f)
+			{
+				src->addFmt(", bias({})", _FormatFloatAsConstant(samplerLodBias));
+			}
     	}
     	// gradient parameters
     	if (texOpcode == GPU7_TEX_INST_SAMPLE_G)
@@ -2553,6 +2610,21 @@ static void _emitTEXSampleTextureCode(LatteDecompilerShaderContext* shaderContex
     	}
 
     	// lod bias (TODO: wht?)
+
+    	if (emulateCompare)
+    	{
+    		// pass the sampler's configured depth-compare function to the compare emulation
+    		// (E_DEPTH_COMPARE encoding). Without a bound sampler, fall back to LESS - the
+    		// comparison the emulation hardcoded before the compare function was honored
+    		uint32 compareFuncValue = 1;
+    		auto stageSamplerIndex = shaderContext->shader->textureUnitSamplerAssignment[texInstruction->textureFetch.textureIndex];
+    		if (stageSamplerIndex != LATTE_DECOMPILER_SAMPLER_NONE)
+    		{
+    			uint32 samplerIndex = stageSamplerIndex + LatteDecompiler_getTextureSamplerBaseIndex(shaderContext->shader->shaderType);
+    			compareFuncValue = (uint32)shaderContext->contextRegistersNew->SQ_TEX_SAMPLER[samplerIndex].WORD0.get_DEPTH_COMPARE_FUNCTION();
+    		}
+    		src->addFmt(", {}u", compareFuncValue);
+    	}
 
         src->add(")");
     }
@@ -2642,8 +2714,9 @@ static void _emitTEXSampleTextureCode(LatteDecompilerShaderContext* shaderContex
 static void _emitTEXGetTextureResInfoCode(LatteDecompilerShaderContext* shaderContext, LatteDecompilerTEXInstruction* texInstruction)
 {
 	StringBuf* src = shaderContext->shaderSource;
-	src->addFmt("R{}", texInstruction->dstGpr);
-	src->add("i");
+	// route through _getRegisterVarName like every other TEX emitter - a raw "R{}i" here produced
+	// an undefined identifier whenever useArrayGPRs is active (registers represented as Ri[]/Rf[])
+	src->add(_getRegisterVarName(shaderContext, texInstruction->dstGpr));
 	src->add(".");
 
 	const char* resultElemTable[4] = {"x","y","z","w"};
@@ -2669,8 +2742,11 @@ static void _emitTEXGetTextureResInfoCode(LatteDecompilerShaderContext* shaderCo
 
 	if (static_cast<MetalRenderer*>(g_renderer.get())->SupportsFramebufferFetch() && shaderContext->shader->textureRenderTargetIndex[texInstruction->textureFetch.textureIndex] != 255)
 	{
-	    // TODO: use the render target size
-	    src->addFmt(" = int4(1920, 1080, 1, 1).");
+	    // the color attachment is declared as texture2d, so its dimensions are queryable directly.
+	    // The fb-fetch classification guarantees a 2D view that matches the sampled view
+	    // (LatteShader_CalcPSRenderTargetIndices), so this returns the same size textureSize()
+	    // would return on the Vulkan path
+	    src->addFmt(" = int4(col{}.get_width(), col{}.get_height(), 1, 1).", (uint32)shaderContext->shader->textureRenderTargetIndex[texInstruction->textureFetch.textureIndex], (uint32)shaderContext->shader->textureRenderTargetIndex[texInstruction->textureFetch.textureIndex]);
 	}
 	else
 	{
@@ -2791,10 +2867,13 @@ static void _emitTEXSetCubemapIndexCode(LatteDecompilerShaderContext* shaderCont
 	src->addFmt("cubeMapArrayIndex{}", texInstruction->textureFetch.textureIndex);
 	const char* resultElemTable[4] = {"x","y","z","w"};
 
+	// route the source GPR through _getRegisterVarName: with array GPRs active the registers
+	// are Ri[]/Rf[] arrays and a raw R{n}i/R{n}f name would be an undeclared identifier
+	// (same defect class as the RESINFO emission fixed earlier)
 	if (shaderContext->typeTracker.defaultDataType == LATTE_DECOMPILER_DTYPE_SIGNED_INT)
-		src->addFmt(" = as_type<float>(R{}i.{});" _CRLF, texInstruction->srcGpr, resultElemTable[texInstruction->textureFetch.srcSel[0]]);
+		src->addFmt(" = as_type<float>({}.{});" _CRLF, _getRegisterVarName(shaderContext, texInstruction->srcGpr), resultElemTable[texInstruction->textureFetch.srcSel[0]]);
 	else if (shaderContext->typeTracker.defaultDataType == LATTE_DECOMPILER_DTYPE_FLOAT)
-		src->addFmt(" = R{}f.{};" _CRLF, texInstruction->srcGpr, resultElemTable[texInstruction->textureFetch.srcSel[0]]);
+		src->addFmt(" = {}.{};" _CRLF, _getRegisterVarName(shaderContext, texInstruction->srcGpr), resultElemTable[texInstruction->textureFetch.srcSel[0]]);
 	else
 		cemu_assert_unimplemented();
 }
@@ -3481,6 +3560,12 @@ static void _emitStreamWriteCode(LatteDecompilerShaderContext* shaderContext, La
 #endif
 		return;
 	}
+	if (shaderContext->shaderType == LatteConst::ShaderType::Vertex && shaderContext->options->usesGeometryShader)
+	{
+		// mesh-path vertex shader with a real geometry shader has no sb/sbBase binding (see
+		// emitInputs) - streamout is captured by the geometry shader instead
+		return;
+	}
 	uint32 streamoutBufferIndex;
 	if (cfInstruction->type == GPU7_CF_INST_MEM_STREAM0_WRITE)
 		streamoutBufferIndex = 0;
@@ -3820,20 +3905,34 @@ void LatteDecompiler_emitHelperFunctions(LatteDecompilerShaderContext* shaderCon
 	// TODO: lod_options overload
 	// TODO: when the sampler has linear min mag filter, use gather and filter manually
 	// TODO: offset?
+	// compareFunc uses the E_DEPTH_COMPARE encoding from the sampler registers (the emulated
+	// path previously hardcoded '<', ignoring the configured compare function)
 	fCStr_shaderSource->add(""
 	"template<typename TextureT, typename CoordT>\r\n"
-	"float sampleCompareEmulate(TextureT tex, sampler samplr, CoordT coord, float compareValue) {\r\n"
-	    "return compareValue < tex.sample(samplr, coord).x ? 1.0 : 0.0;\r\n"
+	"float sampleCompareEmulate(TextureT tex, sampler samplr, CoordT coord, float compareValue, uint compareFunc) {\r\n"
+	    "float texel = tex.sample(samplr, coord).x;\r\n"
+	    "switch (compareFunc) {\r\n"
+	    "    case 0u: return 0.0;\r\n"                               // NEVER
+	    "    case 1u: return compareValue <  texel ? 1.0 : 0.0;\r\n" // LESS
+	    "    case 2u: return compareValue == texel ? 1.0 : 0.0;\r\n" // EQUAL
+	    "    case 3u: return compareValue <= texel ? 1.0 : 0.0;\r\n" // LEQUAL
+	    "    case 4u: return compareValue >  texel ? 1.0 : 0.0;\r\n" // GREATER
+	    "    case 5u: return compareValue != texel ? 1.0 : 0.0;\r\n" // NOTEQUAL
+	    "    case 6u: return compareValue >= texel ? 1.0 : 0.0;\r\n" // GEQUAL
+	    "    default: return 1.0;\r\n"                               // ALWAYS
+	    "}\r\n"
 	"}\r\n"
 	);
 
 	// Texture calculate lod
 	// TODO: only add when needed
+	// matches GLSL textureQueryLod semantics: .x = raw computed LOD, .y = LOD clamped to the
+	// sampler's LOD range (the previous floor/fract split returned different components
+	// entirely)
 	fCStr_shaderSource->add(""
 	"template<typename TextureT, typename CoordT>\r\n"
 	"float2 textureCalculateLod(TextureT tex, sampler samplr, CoordT coord) {\r\n"
-        "float lod = tex.calculate_unclamped_lod(samplr, coord);\r\n"
-        "return float2(floor(lod), fract(lod));\r\n"
+        "return float2(tex.calculate_unclamped_lod(samplr, coord), tex.calculate_clamped_lod(samplr, coord));\r\n"
 	"}\r\n");
 
 	// clamp
@@ -3926,15 +4025,30 @@ static void LatteDecompiler_emitAttributeImport(LatteDecompilerShaderContext* sh
 	src->add(");" _CRLF);
 }
 
+#ifdef CEMU_DEBUG_ASSERT
+// Declared in LatteDecompilerEmitGLSLHeader.hpp (compiled in LatteDecompilerEmitGLSL.cpp).
+// Used by the SupportBuffer layout parity oracle in LatteDecompiler_emitMSLShader
+namespace LatteDecompiler
+{
+	void _emitUniformVariables(LatteDecompilerShaderContext* decompilerContext, RendererAPI rendererType, LatteDecompilerOutputUniformOffsets& uniformOffsets);
+}
+#endif
+
 void LatteDecompiler_emitMSLShader(LatteDecompilerShaderContext* shaderContext, LatteDecompilerShader* shader)
 {
     bool isRectVertexShader = UseRectEmulation(*shaderContext->contextRegistersNew);
     bool usesGeometryShader = UseGeometryShader(*shaderContext->contextRegistersNew, shaderContext->options->usesGeometryShader);
     bool fetchVertexManually = (usesGeometryShader || (shaderContext->fetchShader && shaderContext->fetchShader->mtlFetchVertexManually));
+	// export the structural path flags so consumers (MetalShaderTranslator) branch on the same
+	// decisions that shaped the emitted source instead of re-deriving them from the context state
+	shaderContext->output->fetchVertexManually = fetchVertexManually;
 
 	StringBuf* src = new StringBuf(1024*1024*12); // reserve 12MB for generated source (we resize-to-fit at the end)
 	shaderContext->shaderSource = src;
 
+	// source-text marker, emitted unconditionally before anything else - consumers that rewrite this
+	// source require it (see kMslDecompilerSourceMarker in MetalCommon.h)
+	src->addFmt("{}" _CRLF, kMslDecompilerSourceMarker);
 	// debug info
 	src->addFmt("// shader {:016x}" _CRLF, shaderContext->shaderBaseHash);
 #ifdef CEMU_DEBUG_ASSERT
@@ -3946,6 +4060,57 @@ void LatteDecompiler_emitMSLShader(LatteDecompilerShaderContext* shaderContext, 
     src->add("using namespace metal;" _CRLF);
 	// header part (definitions for inputs and outputs)
 	LatteDecompiler::emitHeader(shaderContext, isRectVertexShader, usesGeometryShader, fetchVertexManually);
+#ifdef CEMU_DEBUG_ASSERT
+	// SupportBuffer layout parity oracle. The MSL SupportBuffer must be byte-identical to the
+	// Vulkan ufBlock. Both header emitters derive their declarations from the shared
+	// ComputeSupportBufferLayout (LatteDecompilerEmitSupportBufferLayout.hpp), so a layout drift
+	// can only happen if one emitter fails to propagate a computed offset (or the emitters stop
+	// using the shared table). Re-run the GLSL emitter into a scratch buffer and compare the
+	// recorded offsets against the ones the MSL emitter produced above.
+	{
+		StringBuf* savedSource = shaderContext->shaderSource;
+		StringBuf* scratchSource = new StringBuf(16 * 1024); // only the uniform block section is emitted here
+		LatteDecompilerOutputUniformOffsets oracleOffsets;
+		shaderContext->shaderSource = scratchSource;
+		LatteDecompiler::_emitUniformVariables(shaderContext, RendererAPI::Vulkan, oracleOffsets);
+		shaderContext->shaderSource = savedSource;
+		delete scratchSource;
+		auto& mslOffsets = shaderContext->output->uniformOffsetsVK;
+		auto checkOffset = [&](sint32 mslValue, sint32 oracleValue, const char* fieldName)
+		{
+			if (mslValue != oracleValue)
+			{
+				cemuLog_log(LogType::Force, "SupportBuffer layout mismatch for shader {:016x}: field {} has MSL offset {} but Vulkan ufBlock offset {}", shaderContext->shaderBaseHash, fieldName, mslValue, oracleValue);
+				cemu_assert_debug(false);
+			}
+		};
+		checkOffset(mslOffsets.offset_remapped, oracleOffsets.offset_remapped, "remapped");
+		checkOffset(mslOffsets.offset_uniformRegister, oracleOffsets.offset_uniformRegister, "uniformRegister");
+		checkOffset(mslOffsets.count_uniformRegister, oracleOffsets.count_uniformRegister, "count_uniformRegister");
+		checkOffset(mslOffsets.offset_alphaTestRef, oracleOffsets.offset_alphaTestRef, "alphaTestRef");
+		checkOffset(mslOffsets.offset_pointSize, oracleOffsets.offset_pointSize, "pointSize");
+		checkOffset(mslOffsets.offset_fragCoordScale, oracleOffsets.offset_fragCoordScale, "fragCoordScale");
+		checkOffset(mslOffsets.offset_windowSpaceToClipSpaceTransform, oracleOffsets.offset_windowSpaceToClipSpaceTransform, "windowSpaceToClipSpaceTransform");
+		for (sint32 i = 0; i < LATTE_NUM_MAX_TEX_UNITS; i++)
+		{
+			if (mslOffsets.offset_texScale[i] != oracleOffsets.offset_texScale[i])
+			{
+				cemuLog_log(LogType::Force, "SupportBuffer layout mismatch for shader {:016x}: field texScale[{}] has MSL offset {} but Vulkan ufBlock offset {}", shaderContext->shaderBaseHash, i, mslOffsets.offset_texScale[i], oracleOffsets.offset_texScale[i]);
+				cemu_assert_debug(false);
+			}
+		}
+		checkOffset(mslOffsets.offset_verticesPerInstance, oracleOffsets.offset_verticesPerInstance, "verticesPerInstance");
+		for (sint32 i = 0; i < LATTE_NUM_STREAMOUT_BUFFER; i++)
+		{
+			if (mslOffsets.offset_streamoutBufferBase[i] != oracleOffsets.offset_streamoutBufferBase[i])
+			{
+				cemuLog_log(LogType::Force, "SupportBuffer layout mismatch for shader {:016x}: field streamoutBufferBase[{}] has MSL offset {} but Vulkan ufBlock offset {}", shaderContext->shaderBaseHash, i, mslOffsets.offset_streamoutBufferBase[i], oracleOffsets.offset_streamoutBufferBase[i]);
+				cemu_assert_debug(false);
+			}
+		}
+		checkOffset(mslOffsets.offset_endOfBlock, oracleOffsets.offset_endOfBlock, "endOfBlock");
+	}
+#endif
 	// helper functions
 	LatteDecompiler_emitHelperFunctions(shaderContext, src);
 	const char* functionType = "";
@@ -4129,7 +4294,10 @@ void LatteDecompiler_emitMSLShader(LatteDecompilerShaderContext* shaderContext, 
 	{
 	    if (shader->shaderType == LatteConst::ShaderType::Vertex)
 		{
-            if (usesGeometryShader)
+            // A rect vertex shader uses the ObjectPayload emitted by _emitVSOutputs, which carries
+            // only vertexOut - writing primitiveId there does not compile, and the rect emulation
+            // geometry shader generates its vertices without needing the input-primitive index
+            if (usesGeometryShader && !isRectVertexShader)
             {
            	    // Calculate the imaginary vertex id
                 LattePrimitiveMode vsOutPrimType = shaderContext->contextRegistersNew->VGT_PRIMITIVE_TYPE.get_PRIMITIVE_MODE();
@@ -4137,14 +4305,19 @@ void LatteDecompiler_emitMSLShader(LatteDecompilerShaderContext* shaderContext, 
            	        src->add("uint vid = tig + tid;" _CRLF);
                 else
        	            src->add("uint vid = tig * VERTICES_PER_VERTEX_PRIMITIVE + tid;" _CRLF);
-          		src->add("uint iid = vid / supportBuffer.verticesPerInstance;" _CRLF);
-                src->add("vid %= supportBuffer.verticesPerInstance;" _CRLF);
+          		src->add("uint iid = vid / verticesPerInstance;" _CRLF);
+                src->add("vid %= verticesPerInstance;" _CRLF);
 
           		// Fetch the input
           		src->add("VertexIn in = fetchVertex(vid, iid, indexBuffer, indexType VERTEX_BUFFERS);" _CRLF);
 
           		// Output is defined as object payload
           		src->add("object_data VertexOut& out = objectPayload.vertexOut[tid];" _CRLF);
+          		// the mesh GS has no input-primitive index of its own (MSL has no gl_PrimitiveIDIn
+          		// equivalent for mesh functions) - carry it through the payload. tig is the index of
+          		// the input primitive processed by this object threadgroup
+          		src->add("if (tid == 0)" _CRLF);
+          		src->add("    objectPayload.primitiveId = tig;" _CRLF);
             }
             else
             {
@@ -4271,7 +4444,26 @@ void LatteDecompiler_emitMSLShader(LatteDecompilerShaderContext* shaderContext, 
 			cemu_assert_debug((shaderContext->output->streamoutBufferStride[i]&3) == 0);
 
 			if (shader->shaderType == LatteConst::ShaderType::Vertex) // vertex shader
-				src->addFmt("int sbBase{} = supportBuffer.streamoutBufferBase{}/4 + (vid + supportBuffer.verticesPerInstance * iid)*{};" _CRLF, i, i, shaderContext->output->streamoutBufferStride[i] / 4);
+			{
+				if (shaderContext->options->usesGeometryShader)
+				{
+					// real geometry shader: neither sb nor sbBase are declared for the mesh-path
+					// vertex shader (see emitInputs) and streamout is captured by the geometry
+					// shader instead. Emitting the write here produced a shader that failed to
+					// compile (undeclared sb), dropping every draw of the pipeline - skip it
+					cemuLog_logOnce(LogType::Force, "LatteDecompilerEmitMSL: vertex-stage streamout with a geometry shader is not supported on Metal, the geometry shader captures streamout instead.");
+					continue;
+				}
+				if (usesGeometryShader)
+				{
+					// rect-emulation mesh path (no real GS): the vertex count comes from the
+					// dedicated binding parameter, the SupportBuffer stays byte-identical to the
+					// Vulkan ufBlock (see emitHeader)
+					src->addFmt("int sbBase{} = supportBuffer.streamoutBufferBase{}/4 + (vid + verticesPerInstance * iid)*{};" _CRLF, i, i, shaderContext->output->streamoutBufferStride[i] / 4);
+				}
+				else
+					src->addFmt("int sbBase{} = supportBuffer.streamoutBufferBase{}/4 + (vid + supportBuffer.verticesPerInstance * iid)*{};" _CRLF, i, i, shaderContext->output->streamoutBufferStride[i] / 4);
+			}
 			else // geometry shader
 			{
 				uint32 gsOutPrimType = shaderContext->contextRegisters[mmVGT_GS_OUT_PRIM_TYPE];
@@ -4280,7 +4472,7 @@ void LatteDecompiler_emitMSLShader(LatteDecompilerShaderContext* shaderContext, 
 
 				cemu_assert_debug(gsOutPrimType == 0); // currently we only properly handle GS output primitive points
 
-				src->addFmt("int sbBase{} = supportBuffer.streamoutBufferBase{}/4 + (gl_PrimitiveIDIn * {})*{};" _CRLF, i, i, maxVerticesInGS, shaderContext->output->streamoutBufferStride[i] / 4);
+				src->addFmt("int sbBase{} = supportBuffer.streamoutBufferBase{}/4 + (objectPayload.primitiveId * {})*{};" _CRLF, i, i, maxVerticesInGS, shaderContext->output->streamoutBufferStride[i] / 4);
 			}
 		}
 
@@ -4407,7 +4599,7 @@ void LatteDecompiler_emitMSLShader(LatteDecompilerShaderContext* shaderContext, 
             if (shaderContext->contextRegisters[mmVGT_GS_OUT_PRIM_TYPE] == 1) // Line strip
             {
                 src->add("for (uint8_t i = 0; i < GET_PRIMITIVE_COUNT(vertexIndex) * 2; i++) {" _CRLF);
-                src->add("mesh.set_index(i, (i 2 3) + i % 2);" _CRLF);
+                src->add("mesh.set_index(i, (i / 2) + i % 2);" _CRLF);
                 src->add("}" _CRLF);
             }
             else if (shaderContext->contextRegisters[mmVGT_GS_OUT_PRIM_TYPE] == 2) // Triangle strip

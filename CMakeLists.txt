@@ -156,6 +156,12 @@ find_package(RapidJSON REQUIRED)
 find_package(Boost COMPONENTS program_options filesystem nowide REQUIRED)
 find_package(libzip REQUIRED)
 find_package(glslang REQUIRED)
+if (ENABLE_METAL)
+	# SPIRV-Cross is used to translate graphic pack GLSL shaders to MSL
+	find_package(spirv_cross_core CONFIG REQUIRED)
+	find_package(spirv_cross_glsl CONFIG REQUIRED)
+	find_package(spirv_cross_msl CONFIG REQUIRED)
+endif()
 find_package(ZLIB REQUIRED)
 find_package(zstd MODULE REQUIRED) # MODULE so that zstd::zstd is available
 find_package(OpenSSL COMPONENTS Crypto SSL REQUIRED)

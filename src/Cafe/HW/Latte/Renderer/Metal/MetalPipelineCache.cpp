@@ -18,6 +18,13 @@
 #include <openssl/sha.h>
 
 static bool g_compilePipelineThreadInit{false};
+
+// Guards the lifetime of s_cache. It is opened on the loader thread (BeginLoading), read on the
+// loader thread, and used by the detached cache-writer thread (WorkerThread), while Close() runs on
+// the emulation thread at title exit. Without this, Close() could delete the FileCache between the
+// writer's null check and its AddFileAsync call (a use-after-free), and the same window exists for
+// the loader. Every check-then-use pair must therefore sit inside one critical section
+static std::mutex s_fileCacheMutex;
 static std::mutex g_compilePipelineMutex;
 static std::condition_variable g_compilePipelineCondVar;
 static std::queue<MetalPipelineCompiler*> g_compilePipelineRequests;
@@ -78,6 +85,11 @@ static void queuePipeline(MetalPipelineCompiler* v)
 // non-essential means that skipping these drawcalls shouldn't lead to permanently corrupted graphics
 bool IsAsyncPipelineAllowed(const MetalAttachmentsInfo& attachmentsInfo, Vector2i extend, uint32 indexCount)
 {
+	// frame debuggers/GPU captures don't handle async-compiled (initially skipped) draws well -
+	// the draw would be missing from the capture (same guard as the Vulkan backend)
+	if (static_cast<MetalRenderer*>(g_renderer.get())->IsTracingToolEnabled())
+		return false;
+
 	if (extend.x == 1600 && extend.y == 1600)
 		return false; // Splatoon ink mechanics use 1600x1600 R8 and R8G8 framebuffers, this resolution is rare enough that we can just blacklist it globally
 
@@ -105,21 +117,56 @@ MetalPipelineCache::MetalPipelineCache(class MetalRenderer* metalRenderer) : m_m
 
 MetalPipelineCache::~MetalPipelineCache()
 {
+    // the writer thread calls back into this object (SerializePipeline), so it has to be gone before
+    // anything below runs
+    StopStoreThread();
+
+    // drop whatever it had not picked up yet - those jobs are heap objects owned by nobody else
+    DiscardPendingJobs();
+
+    m_pipelineCacheLock.lock();
     for (auto& [key, pipelineObj] : m_pipelineCache)
     {
-        pipelineObj->m_pipeline->release();
+        if (pipelineObj->m_pipeline)
+            pipelineObj->m_pipeline.load()->release();
         delete pipelineObj;
     }
+    m_pipelineCache.clear();
+    m_pipelineCacheLock.unlock();
 }
+
 
 PipelineObject* MetalPipelineCache::GetRenderPipelineState(const LatteFetchShader* fetchShader, const LatteDecompilerShader* vertexShader, const LatteDecompilerShader* geometryShader, const LatteDecompilerShader* pixelShader, const MetalAttachmentsInfo& lastUsedAttachmentsInfo, const MetalAttachmentsInfo& activeAttachmentsInfo, Vector2i extend, uint32 indexCount, const LatteContextRegister& lcr)
 {
     uint64 hash = CalculatePipelineHash(fetchShader, vertexShader, geometryShader, pixelShader, lastUsedAttachmentsInfo, activeAttachmentsInfo, lcr);
-    PipelineObject*& pipelineObj = m_pipelineCache[hash];
+    m_pipelineCacheLock.lock();
+    auto it = m_pipelineCache.find(hash);
+    PipelineObject* pipelineObj = (it != m_pipelineCache.end()) ? it->second : nullptr;
+    if (pipelineObj && pipelineObj->compileFailed && !pipelineObj->permanentFailure)
+    {
+        // evict transiently failed compilations so this call retries instead of skipping draws
+        // forever (permanent failures stay cached: retrying them would fail identically per draw)
+        m_pipelineCache.erase(it);
+        delete pipelineObj;
+        pipelineObj = nullptr;
+    }
     if (pipelineObj)
+    {
+        // still compiling asynchronously (or permanently unsupported)
+        bool persistNow = pipelineObj->persistWhenCompiled && pipelineObj->m_pipeline != nullptr && !pipelineObj->compileFailed;
+        if (persistNow)
+            pipelineObj->persistWhenCompiled = false;
+        m_pipelineCacheLock.unlock();
+        // asynchronous compile finished successfully and wasn't persisted yet: AddCurrentStateToCache
+        // snapshots the active register/shader state, so it must run here on the render thread while
+        // the state that produced this pipeline is current
+        if (persistNow)
+            AddCurrentStateToCache(hash, lastUsedAttachmentsInfo);
         return pipelineObj;
-
+    }
     pipelineObj = new PipelineObject();
+    m_pipelineCache[hash] = pipelineObj;
+    m_pipelineCacheLock.unlock();
 
     MetalPipelineCompiler* compiler = new MetalPipelineCompiler(m_mtlr, *pipelineObj);
     compiler->InitFromState(fetchShader, vertexShader, geometryShader, pixelShader, lastUsedAttachmentsInfo, activeAttachmentsInfo, lcr);
@@ -128,6 +175,7 @@ PipelineObject* MetalPipelineCache::GetRenderPipelineState(const LatteFetchShade
     if (GetConfig().async_compile)
 		allowAsyncCompile = IsAsyncPipelineAllowed(activeAttachmentsInfo, extend, indexCount);
 
+    bool compileSucceeded;
 	if (allowAsyncCompile)
 	{
 	    if (!g_compilePipelineThreadInit)
@@ -137,16 +185,23 @@ PipelineObject* MetalPipelineCache::GetRenderPipelineState(const LatteFetchShade
 		}
 
 		queuePipeline(compiler);
+		// the result is determined by the compile thread (which sets compileFailed on error), so
+		// persistence is deferred until the next render-thread request observes the outcome
+		pipelineObj->persistWhenCompiled = true;
+		compileSucceeded = false;
 	}
 	else
 	{
 	    // Also force compile to ensure that the pipeline is ready
-        cemu_assert_debug(compiler->Compile(true, true, true));
+        compileSucceeded = compiler->Compile(true, true, true);
+        if (!compileSucceeded)
+            cemuLog_log(LogType::Force, "failed to compile render pipeline synchronously");
         delete compiler;
 	}
 
-	// Save to cache
-    AddCurrentStateToCache(hash, lastUsedAttachmentsInfo);
+	// Save to cache (failed compilations are not persisted, they will be re-compiled from the live state)
+    if (compileSucceeded)
+        AddCurrentStateToCache(hash, lastUsedAttachmentsInfo);
 
     return pipelineObj;
 }
@@ -176,6 +231,10 @@ uint64 MetalPipelineCache::CalculatePipelineHash(const LatteFetchShader* fetchSh
 		stateHash += GetMtlPixelFormat(lastUsedAttachmentsInfo.depthFormat, true);
 		stateHash = std::rotl<uint64>(stateHash, 7);
 
+		if (lastUsedAttachmentsInfo.hasStencil)
+			stateHash += 1;
+		stateHash = std::rotl<uint64>(stateHash, 1);
+
 		if (activeAttachmentsInfo.depthFormat == Latte::E_GX2SURFFMT::INVALID_FORMAT)
 		{
             stateHash += 1;
@@ -203,8 +262,16 @@ uint64 MetalPipelineCache::CalculatePipelineHash(const LatteFetchShader* fetchSh
 
 	uint32* ctxRegister = lcr.GetRawView();
 
+	// auxHash as well as baseHash: the MSL emitter bakes the sampler LOD bias into the emitted
+	// shader, so two vertex shader variants differing only in auxHash generate different MSL and
+	// must not share one cached pipeline
 	if (vertexShader)
-		stateHash += vertexShader->baseHash;
+		stateHash += vertexShader->baseHash + vertexShader->auxHash;
+
+	stateHash = std::rotl<uint64>(stateHash, 13);
+
+	if (geometryShader)
+		stateHash += geometryShader->baseHash + geometryShader->auxHash; // the GS is baked into the pipeline as the mesh function
 
 	stateHash = std::rotl<uint64>(stateHash, 13);
 
@@ -218,6 +285,11 @@ uint64 MetalPipelineCache::CalculatePipelineHash(const LatteFetchShader* fetchSh
 	stateHash = std::rotl<uint64>(stateHash, 7);
 
 	stateHash += ctxRegister[Latte::REGADDR::PA_CL_CLIP_CNTL];
+	stateHash = std::rotl<uint64>(stateHash, 7);
+
+	// toggling VPORT_X_OFFSET_ENA changes IsRasterizationEnabled() and with it the pipeline shape,
+	// so the register must be part of the key
+	stateHash += ctxRegister[Latte::REGADDR::PA_CL_VTE_CNTL];
 	stateHash = std::rotl<uint64>(stateHash, 7);
 
 	const auto colorControlReg = ctxRegister[Latte::REGADDR::CB_COLOR_CONTROL];
@@ -238,7 +310,9 @@ uint64 MetalPipelineCache::CalculatePipelineHash(const LatteFetchShader* fetchSh
 	}
 
 	// Mesh pipeline
-	const LattePrimitiveMode primitiveMode = static_cast<LattePrimitiveMode>(LatteGPUState.contextRegister[mmVGT_PRIMITIVE_TYPE]);
+	// read the primitive mode from the passed context - on the pipeline cache loader thread the
+	// global contextRegister holds whatever the render thread is currently doing
+	const LattePrimitiveMode primitiveMode = static_cast<LattePrimitiveMode>(lcr.GetRawView()[mmVGT_PRIMITIVE_TYPE]);
     bool isPrimitiveRect = (primitiveMode == Latte::LATTE_VGT_PRIMITIVE_TYPE::E_PRIMITIVE_TYPE::RECTS);
 
     bool usesGeometryShader = (geometryShader != nullptr || isPrimitiveRect);
@@ -273,37 +347,43 @@ uint32 MetalPipelineCache::BeginLoading(uint64 cacheTitleId)
 	g_mtlCacheState.pipelinesLoaded = 0;
 	g_mtlCacheState.pipelinesQueued = 0;
 
-	// start async compilation threads
-	m_compilationCount.store(0);
 	m_compilationQueue.clear();
 
 	// get core count
 	uint32 cpuCoreCount = GetPhysicalCoreCount();
-	m_numCompilationThreads = std::clamp(cpuCoreCount, 1u, 8u);
+	uint32 numCompilationThreads = std::clamp(cpuCoreCount, 1u, 8u);
 	// TODO: uncomment?
 	//if (VulkanRenderer::GetInstance()->GetDisableMultithreadedCompilation())
-	//	m_numCompilationThreads = 1;
+	//	numCompilationThreads = 1;
 
+	// open cache file or create it. This happens BEFORE the compile threads are spawned on purpose:
+	// with nothing to load there is nothing for them to do, and a thread spawned here would block on
+	// the empty queue until EndLoading pushes a shutdown token - which on this path is only reached
+	// after the progress loop, and that loop dereferences the (still null) cache - see UpdateLoading
+	uint32 fileCount = 0;
+	cemu_assert_debug(s_cache == nullptr);
+	{
+		// same critical section as the writer thread and Close() - see s_fileCacheMutex
+		std::lock_guard<std::mutex> lock(s_fileCacheMutex);
+		s_cache = FileCache::Open(pathCacheFile, true, LatteShaderCache_getPipelineCacheExtraVersion(cacheTitleId));
+		if (!s_cache)
+		{
+			cemuLog_log(LogType::Force, "Failed to open or create Metal pipeline cache file: {}", _pathToUtf8(pathCacheFile));
+			return 0;
+		}
+		s_cache->UseCompression(false);
+		g_mtlCacheState.pipelineMaxFileIndex = s_cache->GetMaximumFileIndex();
+		fileCount = s_cache->GetFileCount();
+	}
+
+	// start async compilation threads
+	m_numCompilationThreads = numCompilationThreads;
 	for (uint32 i = 0; i < m_numCompilationThreads; i++)
 	{
 		std::thread compileThread(&MetalPipelineCache::CompilerThread, this);
 		compileThread.detach();
 	}
-
-	// open cache file or create it
-	cemu_assert_debug(s_cache == nullptr);
-	s_cache = FileCache::Open(pathCacheFile, true, LatteShaderCache_getPipelineCacheExtraVersion(cacheTitleId));
-	if (!s_cache)
-	{
-		cemuLog_log(LogType::Force, "Failed to open or create Metal pipeline cache file: {}", _pathToUtf8(pathCacheFile));
-		return 0;
-	}
-	else
-	{
-		s_cache->UseCompression(false);
-		g_mtlCacheState.pipelineMaxFileIndex = s_cache->GetMaximumFileIndex();
-	}
-	return s_cache->GetFileCount();
+	return fileCount;
 }
 
 bool MetalPipelineCache::UpdateLoading(uint32& pipelinesLoadedTotal, uint32& pipelinesMissingShaders)
@@ -320,7 +400,17 @@ bool MetalPipelineCache::UpdateLoading(uint32& pipelinesLoadedTotal, uint32& pip
 
 		uint64 fileNameA, fileNameB;
 		std::vector<uint8> fileData;
-		if (s_cache->GetFileByIndex(g_mtlCacheState.pipelineLoadIndex, &fileNameA, &fileNameB, fileData))
+		bool fileFound = false;
+		{
+			// same critical section as the writer thread and Close() - the cache pointer must not be
+			// deleted between the check and the use (see s_fileCacheMutex). A null cache means either
+			// the open failed or the title was exited; either way there is nothing left to load
+			std::lock_guard<std::mutex> lock(s_fileCacheMutex);
+			if (!s_cache)
+				return false;
+			fileFound = s_cache->GetFileByIndex(g_mtlCacheState.pipelineLoadIndex, &fileNameA, &fileNameB, fileData);
+		}
+		if (fileFound)
 		{
 			// queue for async compilation
 			g_mtlCacheState.pipelinesQueued++;
@@ -352,6 +442,8 @@ void MetalPipelineCache::EndLoading()
 
 void MetalPipelineCache::Close()
 {
+    // the mutex is what makes the writer/loader threads' null checks meaningful - see s_fileCacheMutex
+    std::lock_guard<std::mutex> lock(s_fileCacheMutex);
     if(s_cache)
     {
         delete s_cache;
@@ -386,25 +478,14 @@ struct CachedPipeline
 
 void MetalPipelineCache::LoadPipelineFromCache(std::span<uint8> fileData)
 {
-	static FSpinlock s_spinlockSharedInternal;
-
 	// deserialize file
-	LatteContextRegister* lcr = new LatteContextRegister();
-	s_spinlockSharedInternal.lock();
-	CachedPipeline* cachedPipeline = new CachedPipeline();
-	s_spinlockSharedInternal.unlock();
-
+	auto cachedPipeline = std::make_unique<CachedPipeline>();
 	MemStreamReader streamReader(fileData.data(), fileData.size());
 	if (!DeserializePipeline(streamReader, *cachedPipeline))
-	{
-		// failed to deserialize
-		s_spinlockSharedInternal.lock();
-		delete lcr;
-		delete cachedPipeline;
-		s_spinlockSharedInternal.unlock();
-		return;
-	}
+		return; // failed to deserialize
+
 	// restored register view from compacted state
+	auto lcr = std::make_unique<LatteContextRegister>();
 	Latte::LoadGPURegisterState(*lcr, cachedPipeline->gpuState);
 
 	LatteDecompilerShader* vertexShader = nullptr;
@@ -455,31 +536,59 @@ void MetalPipelineCache::LoadPipelineFromCache(std::span<uint8> fileData)
 	{
 		MetalPipelineCompiler pp(m_mtlr, *pipelineObject);
 		pp.InitFromState(vertexShader->compatibleFetchShader, vertexShader, geometryShader, pixelShader, cachedPipeline->lastUsedAttachmentsInfo, attachmentsInfo, *lcr);
-		pp.Compile(true, true, false);
+		if (!pp.Compile(true, true, false))
+		{
+			// do not cache broken pipelines; they will be re-compiled from the live state during gameplay
+			cemuLog_log(LogType::Force, "Failed to compile pipeline restored from cache, skipping");
+			delete pipelineObject;
+			return;
+		}
 		// destroy pp early
 	}
 
 	// Cache the pipeline
    	uint64 pipelineStateHash = CalculatePipelineHash(vertexShader->compatibleFetchShader, vertexShader, geometryShader, pixelShader, cachedPipeline->lastUsedAttachmentsInfo, attachmentsInfo, *lcr);
    	m_pipelineCacheLock.lock();
-   	m_pipelineCache[pipelineStateHash] = pipelineObject;
+   	// an identical pipeline may already be present (duplicate cache entries or a live compile
+	// racing the loader) - overwriting would leak the previous object
+   	auto [insertItr, inserted] = m_pipelineCache.try_emplace(pipelineStateHash, pipelineObject);
    	m_pipelineCacheLock.unlock();
-
-	// clean up
-	s_spinlockSharedInternal.lock();
-	delete lcr;
-	delete cachedPipeline;
-	s_spinlockSharedInternal.unlock();
+   	if (!inserted)
+   	{
+		delete pipelineObject;
+   	}
 }
 
 ConcurrentQueue<CachedPipeline*> g_mtlPipelineCachingQueue;
+
+void MetalPipelineCache::DiscardPendingJobs()
+{
+	CachedPipeline* pending = nullptr;
+	while (g_mtlPipelineCachingQueue.peek2(pending))
+		delete pending;
+}
+
+void MetalPipelineCache::StopStoreThread()
+{
+	if (!m_pipelineCacheStoreThread)
+		return;
+	m_storeThreadStop.store(true);
+	// the thread blocks on an empty queue, so it needs a job to wake up on. A null job is the
+	// sentinel for "check the stop flag" (see WorkerThread)
+	g_mtlPipelineCachingQueue.push(nullptr);
+	if (m_pipelineCacheStoreThread->joinable())
+		m_pipelineCacheStoreThread->join();
+	delete m_pipelineCacheStoreThread;
+	m_pipelineCacheStoreThread = nullptr;
+}
 
 void MetalPipelineCache::AddCurrentStateToCache(uint64 pipelineStateHash, const MetalAttachmentsInfo& lastUsedAttachmentsInfo)
 {
 	if (!m_pipelineCacheStoreThread)
 	{
+		// deliberately left joinable: StopStoreThread joins it, and that join is the only thing
+		// keeping the worker from touching this object after the destructor has run
 		m_pipelineCacheStoreThread = new std::thread(&MetalPipelineCache::WorkerThread, this);
-		m_pipelineCacheStoreThread->detach();
 	}
 	// fill job structure with cached GPU state
 	// for each cached pipeline we store:
@@ -503,7 +612,7 @@ void MetalPipelineCache::AddCurrentStateToCache(uint64 pipelineStateHash, const 
 
 bool MetalPipelineCache::SerializePipeline(MemStreamWriter& memWriter, CachedPipeline& cachedPipeline)
 {
-	memWriter.writeBE<uint8>(0x01); // version
+	memWriter.writeBE<uint8>(0x02); // version
 	uint8 presentMask = 0;
 	if (cachedPipeline.vsHash.isPresent)
 		presentMask |= 1;
@@ -531,6 +640,7 @@ bool MetalPipelineCache::SerializePipeline(MemStreamWriter& memWriter, CachedPip
 	for (uint8 i = 0; i < LATTE_NUM_COLOR_TARGET; i++)
 	    memWriter.writeBE<uint16>((uint16)cachedPipeline.lastUsedAttachmentsInfo.colorFormats[i]);
 	memWriter.writeBE<uint16>((uint16)cachedPipeline.lastUsedAttachmentsInfo.depthFormat);
+	memWriter.writeBE<uint8>(cachedPipeline.lastUsedAttachmentsInfo.hasStencil ? 1 : 0);
 
 	Latte::SerializeRegisterState(cachedPipeline.gpuState, memWriter);
 
@@ -540,7 +650,7 @@ bool MetalPipelineCache::SerializePipeline(MemStreamWriter& memWriter, CachedPip
 bool MetalPipelineCache::DeserializePipeline(MemStreamReader& memReader, CachedPipeline& cachedPipeline)
 {
 	// version
-	if (memReader.readBE<uint8>() != 1)
+	if (memReader.readBE<uint8>() != 2)
 	{
 		cemuLog_log(LogType::Force, "Cached Metal pipeline corrupted or has unknown version");
 		return false;
@@ -569,6 +679,7 @@ bool MetalPipelineCache::DeserializePipeline(MemStreamReader& memReader, CachedP
 	for (uint8 i = 0; i < LATTE_NUM_COLOR_TARGET; i++)
 	    cachedPipeline.lastUsedAttachmentsInfo.colorFormats[i] = (Latte::E_GX2SURFFMT)memReader.readBE<uint16>();
 	cachedPipeline.lastUsedAttachmentsInfo.depthFormat = (Latte::E_GX2SURFFMT)memReader.readBE<uint16>();
+	cachedPipeline.lastUsedAttachmentsInfo.hasStencil = memReader.readBE<uint8>() != 0;
 
 	// deserialize GPU state
 	if (!Latte::DeserializeRegisterState(cachedPipeline.gpuState, memReader))
@@ -601,12 +712,30 @@ void MetalPipelineCache::WorkerThread()
 	{
 		CachedPipeline* job;
 		g_mtlPipelineCachingQueue.pop(job);
-		if (!s_cache)
+		if (!job)
 		{
-			delete job;
+			// wake-up sentinel, pushed only by StopStoreThread
+			if (m_storeThreadStop.load())
+				break;
 			continue;
 		}
-		// serialize
+		if (m_storeThreadStop.load())
+		{
+			// shutting down: persisting this would mean calling into a cache that is being taken
+			// down with us (and SerializePipeline runs on the object being destroyed)
+			delete job;
+			break;
+		}
+		// cheap early-out for the drain-after-close case, taken under the lock so it cannot race
+		{
+			std::lock_guard<std::mutex> lock(s_fileCacheMutex);
+			if (!s_cache)
+			{
+				delete job;
+				continue;
+			}
+		}
+		// serialize outside the lock - it is the expensive part and does not touch s_cache
 		MemStreamWriter memWriter(1024 * 4);
 		SerializePipeline(memWriter, *job);
 		auto blob = memWriter.getResult();
@@ -615,7 +744,12 @@ void MetalPipelineCache::WorkerThread()
 		SHA256(blob.data(), blob.size(), hash);
 		uint64 nameA = *(uint64be*)(hash + 0);
 		uint64 nameB = *(uint64be*)(hash + 8);
-		s_cache->AddFileAsync({ nameA, nameB }, blob.data(), blob.size());
+		// null check and use in one critical section so Close() cannot delete s_cache in between
+		{
+			std::lock_guard<std::mutex> lock(s_fileCacheMutex);
+			if (s_cache)
+				s_cache->AddFileAsync({ nameA, nameB }, blob.data(), blob.size());
+		}
 		delete job;
 	}
 }

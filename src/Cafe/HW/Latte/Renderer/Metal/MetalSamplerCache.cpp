@@ -3,6 +3,7 @@
 #include "Cafe/HW/Latte/Core/LatteShader.h"
 #include "Cafe/HW/Latte/Renderer/Metal/LatteToMtl.h"
 
+
 MTL::SamplerBorderColor GetBorderColor(LatteConst::ShaderType shaderType, uint32 stageSamplerIndex, const _LatteRegisterSetSampler* samplerWords, bool logWorkaround = false)
 {
     auto borderType = samplerWords->WORD0.get_BORDER_COLOR_TYPE();
@@ -87,9 +88,9 @@ MetalSamplerCache::~MetalSamplerCache()
     m_samplerCache.clear();
 }
 
-MTL::SamplerState* MetalSamplerCache::GetSamplerState(const LatteContextRegister& lcr, LatteConst::ShaderType shaderType, uint32 stageSamplerIndex, const _LatteRegisterSetSampler* samplerWords)
+MTL::SamplerState* MetalSamplerCache::GetSamplerState(const LatteContextRegister& lcr, LatteConst::ShaderType shaderType, uint32 stageSamplerIndex, const _LatteRegisterSetSampler* samplerWords, bool depthCompareMode)
 {
-    uint64 stateHash = CalculateSamplerHash(lcr, shaderType, stageSamplerIndex, samplerWords);
+    uint64 stateHash = CalculateSamplerHash(lcr, shaderType, stageSamplerIndex, samplerWords, depthCompareMode);
     auto& samplerState = m_samplerCache[stateHash];
     if (samplerState)
         return samplerState;
@@ -102,7 +103,6 @@ MTL::SamplerState* MetalSamplerCache::GetSamplerState(const LatteContextRegister
     // lod
     uint32 iMinLOD = samplerWords->WORD1.get_MIN_LOD();
     uint32 iMaxLOD = samplerWords->WORD1.get_MAX_LOD();
-    //sint32 iLodBias = samplerWords->WORD1.get_LOD_BIAS();
 
     auto filterMip = samplerWords->WORD0.get_MIP_FILTER();
     if (filterMip == Latte::LATTE_SQ_TEX_SAMPLER_WORD0_0::E_Z_FILTER::NONE)
@@ -154,13 +154,22 @@ MTL::SamplerState* MetalSamplerCache::GetSamplerState(const LatteContextRegister
     if (maxAniso > 0)
         samplerDescriptor->setMaxAnisotropy(1 << maxAniso);
 
-    // TODO: set lod bias
-    //samplerInfo.mipLodBias = (float)iLodBias / 64.0f;
+    // Metal has no lod bias property. Do NOT fold the bias into the lod clamps: unlike Vulkan's
+    // mipLodBias, Metal's sampler clamps also apply to EXPLICIT level() sampling, so a clamp-shift
+    // would move explicit-LOD reads (e.g. the DoF chain's textureLod(1.0)) to different mips than
+    // Vulkan. The bias is instead added to the LOD in the generated MSL (see LatteDecompilerEmitMSL:
+    // bias() for implicit-LOD samples, folded into level() for explicit-LOD samples), so the clamps
+    // here carry only the sampler's own MIN_LOD/MAX_LOD
 
-    // depth compare
-    //uint8 depthCompareMode = shader->textureUsesDepthCompare[relative_textureUnit] ? 1 : 0;
-    // TODO: is it okay to just cast?
-    samplerDescriptor->setCompareFunction(GetMtlCompareFunc((Latte::E_COMPAREFUNC)samplerWords->WORD0.get_DEPTH_COMPARE_FUNCTION()));
+    // depth compare. Only honor the guest compare function for units the shader samples with depth
+    // compare - Vulkan does the same (compareEnable is set only when textureUsesDepthCompare, see
+    // VulkanRendererCore.cpp). Applying it unconditionally turned every unit whose sampler register
+    // happened to hold a non-NEVER compare function into a comparison sampler, so a plain
+    // texture2d sample on such a unit read comparison results instead of texels
+    if (depthCompareMode)
+        samplerDescriptor->setCompareFunction(GetMtlCompareFunc((Latte::E_COMPAREFUNC)samplerWords->WORD0.get_DEPTH_COMPARE_FUNCTION()));
+    else
+        samplerDescriptor->setCompareFunction(MTL::CompareFunctionNever);
 
     // Border color
     auto borderColor = GetBorderColor(shaderType, stageSamplerIndex, samplerWords, true);
@@ -171,7 +180,7 @@ MTL::SamplerState* MetalSamplerCache::GetSamplerState(const LatteContextRegister
     return samplerState;
 }
 
-uint64 MetalSamplerCache::CalculateSamplerHash(const LatteContextRegister& lcr, LatteConst::ShaderType shaderType, uint32 stageSamplerIndex, const _LatteRegisterSetSampler* samplerWords)
+uint64 MetalSamplerCache::CalculateSamplerHash(const LatteContextRegister& lcr, LatteConst::ShaderType shaderType, uint32 stageSamplerIndex, const _LatteRegisterSetSampler* samplerWords, bool depthCompareMode)
 {
     uint64 hash = 0;
     hash = std::rotl<uint64>(hash, 17);
@@ -185,6 +194,11 @@ uint64 MetalSamplerCache::CalculateSamplerHash(const LatteContextRegister& lcr, 
 
     hash = std::rotl<uint64>(hash, 5);
     hash += (uint64)borderColor;
+
+    // the compare-mode gate is not part of the sampler registers: identical words must yield a
+    // comparison sampler for a depth-compare unit and a plain one otherwise
+    hash = std::rotl<uint64>(hash, 3);
+    hash += depthCompareMode ? 1 : 0;
 
     // TODO: check this
 	return hash;

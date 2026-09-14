@@ -604,6 +604,8 @@ if(ENABLE_METAL)
         HW/Latte/Renderer/Metal/MetalRenderer.h
         HW/Latte/Renderer/Metal/MetalSamplerCache.cpp
         HW/Latte/Renderer/Metal/MetalSamplerCache.h
+        HW/Latte/Renderer/Metal/MetalShaderTranslator.cpp
+        HW/Latte/Renderer/Metal/MetalShaderTranslator.h
         HW/Latte/Renderer/Metal/MetalVoidVertexPipeline.cpp
         HW/Latte/Renderer/Metal/MetalVoidVertexPipeline.h
         HW/Latte/Renderer/Metal/RendererShaderMtl.cpp
@@ -620,6 +622,9 @@ if(ENABLE_METAL)
     target_link_libraries(CemuCafe PRIVATE
         "-framework Metal"
         "-framework QuartzCore"
+        spirv-cross-core
+        spirv-cross-glsl
+        spirv-cross-msl
     )
 endif()
 

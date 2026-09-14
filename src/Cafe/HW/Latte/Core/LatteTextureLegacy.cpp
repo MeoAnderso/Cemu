@@ -108,6 +108,9 @@ Latte::E_GX2SURFFMT LatteTexture_ReconstructGX2Format(const Latte::LATTE_SQ_TEX_
 	return gx2Format;
 }
 
+// NOTE: the Metal backend has a read-only mirror of this texture-unit decoding in
+// LatteShader.cpp (MtlResolveSampledViewForFetchCheck) - keep both in sync when changing the
+// base-address/pitch/dimension derivation
 void LatteTexture_updateTexturesForStage(LatteDecompilerShader* shaderContext, uint32 glBackendBaseTexUnit, _LatteRegisterSetTextureUnit* texRegBase)
 {
 	for (sint32 z = 0; z < shaderContext->textureUnitListCount; z++)

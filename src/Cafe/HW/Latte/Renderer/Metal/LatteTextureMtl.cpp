@@ -84,11 +84,69 @@ LatteTextureMtl::LatteTextureMtl(class MetalRenderer* mtlRenderer, Latte::E_DIM 
 	desc->setUsage(usage);
 
 	m_texture = mtlRenderer->GetDevice()->newTexture(desc);
+
+	// Label with the game-side identity so GPU traces are searchable: the label carries the guest
+	// physical address, which identifies every draw touching this texture
+	m_texture->setLabel(ToNSString(fmt::format("latte {:07x} {}x{} m{}{}",
+		physAddress, width, height, mipLevels, isDepth ? " depth" : "")));
+}
+
+MTL::Texture* LatteTextureMtl::GetDepthMirrorSampleView(LatteTextureView* textureView, uint32 gpuSamplerSwizzle)
+{
+	MTL::Texture* colorCopy = GetDepthColorCopy();
+	if (!colorCopy)
+		return nullptr;
+	const LatteMtlSampleViewKey key = {
+		.swizzle = gpuSamplerSwizzle & 0x0FFF0000,
+		.format = (uint16)textureView->format,
+		.dim = (uint8)textureView->dim,
+		.firstMip = (uint8)textureView->firstMip,
+		.numMip = (uint8)textureView->numMip,
+		.firstSlice = (uint16)textureView->firstSlice,
+		.numSlice = (uint16)textureView->numSlice,
+	};
+	auto itr = m_depthMirrorSampleViews.find(key);
+	if (itr != m_depthMirrorSampleViews.end())
+		return itr->second;
+
+	// sample the copy with the same component swizzle the game requested (Vulkan samples a
+	// swizzled depth view) and over the full mip chain. The view type and slice range match the
+	// bound view so 2D-array shadow maps sample the correct cascade layer
+	const auto swizzle = LatteTextureViewMtl::GetSwizzleChannels(format, gpuSamplerSwizzle);
+	const bool mirrorIsArray = (textureView->dim == Latte::E_DIM::DIM_2D_ARRAY);
+	const MTL::TextureType sampleType = mirrorIsArray ? MTL::TextureType2DArray : MTL::TextureType2D;
+	NS::Range sliceRange = mirrorIsArray ? NS::Range::Make(textureView->firstSlice, textureView->numSlice) : NS::Range::Make(textureView->firstSlice, 1);
+	// mirror the game view's mip selection (like MetalRenderer::CreateFeedbackShadowView does):
+	// Vulkan samples the depth view with firstMip/numMip, so LOD clamping must behave identically.
+	// A full-chain view here would let mip-filtered samples (e.g. a mip=linear sampler minifying
+	// into a quarter-res DoF buffer) pick generated mips that the game never sees on Vulkan -
+	// divergent depth content in the DoF path
+	const uint32 mirrorMipCount = (uint32)colorCopy->mipmapLevelCount();
+	const uint32 baseMip = std::min<uint32>((uint32)textureView->firstMip, mirrorMipCount - 1);
+	const uint32 mipCount = std::min<uint32>(std::max<uint32>((uint32)textureView->numMip, 1), mirrorMipCount - baseMip);
+	MTL::Texture* view = colorCopy->newTextureView(colorCopy->pixelFormat(), sampleType, NS::Range::Make(baseMip, mipCount), sliceRange, swizzle);
+	m_depthMirrorSampleViews.emplace(key, view);
+	return view;
 }
 
 LatteTextureMtl::~LatteTextureMtl()
 {
 	m_texture->release();
+	// release through the setter so the cached sample views are dropped too
+	SetDepthColorCopy(nullptr, 0);
+
+	// drop any feedback-loop shadow copy keyed by this texture (see MetalRenderer::
+	// PrepareFeedbackLoopShadowCopies): without this the map retains released views and grows
+	// with every destroyed feedback texture
+	auto& shadowCopies = m_mtlr->m_feedbackShadowCopies;
+	auto shadowItr = shadowCopies.find(this);
+	if (shadowItr != shadowCopies.end())
+	{
+		if (shadowItr->second.texture)
+			shadowItr->second.texture->release();
+		shadowCopies.erase(shadowItr);
+	}
+	m_mtlr->m_feedbackShadowTextures.erase(this);
 }
 
 LatteTextureView* LatteTextureMtl::CreateView(Latte::E_DIM dim, Latte::E_GX2SURFFMT format, sint32 firstMip, sint32 mipCount, sint32 firstSlice, sint32 sliceCount)

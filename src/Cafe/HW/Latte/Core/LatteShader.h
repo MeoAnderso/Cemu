@@ -20,6 +20,16 @@ LatteDecompilerShader* LatteSHRC_FindVertexShader(uint64 baseHash, uint64 auxHas
 LatteDecompilerShader* LatteSHRC_FindGeometryShader(uint64 baseHash, uint64 auxHash);
 LatteDecompilerShader* LatteSHRC_FindPixelShader(uint64 baseHash, uint64 auxHash);
 
+struct _LatteRegisterSetTextureUnit;
+struct LatteContextRegister;
+
+// Classify which pixel shader texture units alias an active color buffer and are read via a
+// framebuffer fetch ([[color(N)]] input) by the MSL emitter. Used by the decompiler analyzer
+// at decompile time and by the aux hash to re-evaluate the classification against the current
+// register state (see LatteSHRC_CalcPSAuxHash). Results are written as one entry per texture
+// unit (255 = not a render target alias)
+void LatteShader_CalcPSRenderTargetIndices(const LatteDecompilerShader* pixelShader, uint64 pixelShaderBaseHash, const uint32* contextRegisters, const struct _LatteRegisterSetTextureUnit* texRegs, const struct LatteContextRegister& lcr, uint8* textureRenderTargetIndex);
+
 
 #define GPU7_PS_MAX_INPUTS	32
 

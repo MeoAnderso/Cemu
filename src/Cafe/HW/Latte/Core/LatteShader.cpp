@@ -18,6 +18,10 @@
 #include "util/helpers/StateHasher.h"
 #ifdef ENABLE_METAL
 #include "Cafe/HW/Latte/Renderer/Metal/LatteToMtl.h"
+#include "Cafe/HW/Latte/Renderer/Metal/MetalShaderTranslator.h"
+#include "Cafe/HW/Latte/Renderer/Metal/MetalRenderer.h"
+#include "Cafe/HW/Latte/Core/LatteTextureView.h"
+#include <atomic>
 #endif
 
 // experimental new decompiler (WIP)
@@ -349,7 +353,10 @@ void LatteShader_CreateRendererShader(LatteDecompilerShader* shader, bool compil
 	// check if a custom shader is present
 	std::string shaderSrc;
 
-	const std::string* customShaderSrc = GraphicPack2::FindCustomShaderSource(shader->baseHash, shader->auxHash, gpShaderType, g_renderer->GetType() == RendererAPI::Vulkan, g_renderer->GetType() == RendererAPI::Metal);
+	// graphic-pack shader files are named after the upstream (backend-independent) aux hash;
+	// on Metal the extended auxHash would never match them
+	const uint64 packAuxHash = shader->packAuxHash ? shader->packAuxHash : shader->auxHash;
+	const std::string* customShaderSrc = GraphicPack2::FindCustomShaderSource(shader->baseHash, packAuxHash, gpShaderType, g_renderer->GetType() == RendererAPI::Vulkan, g_renderer->GetType() == RendererAPI::Metal);
 	if (customShaderSrc)
 	{
 		shaderSrc.assign(*customShaderSrc);
@@ -595,7 +602,31 @@ void LatteSHRC_UpdatePSBaseHash(uint8* pixelShaderPtr, uint32 pixelShaderSize, b
 	_shaderBaseHash_ps = psHash;
 }
 
-uint64 LatteSHRC_CalcVSAuxHash(LatteDecompilerShader* vertexShader, uint32* contextRegisters)
+#ifdef ENABLE_METAL
+// Metal only: folds the sampler LOD_BIAS of the shader's texture units into the aux hash. The
+// MSL emitter bakes each unit's sampler LOD bias into the emitted LOD expressions at decompile
+// time (see LatteDecompilerEmitMSL.cpp), so a compiled variant is permanently tied to the bias
+// values live when it was built. Including the bias (recomputed from the live registers on every
+// shader bind, as the surrounding aux hash is) makes a changed bias select a correctly-baked new
+// variant instead of reusing the stale one. Vulkan applies the bias via the sampler object
+// (VulkanRendererCore), so no other backend needs this extension
+static uint64 _MtlAuxHashExtendSamplerLodBias(uint64 auxHash, const LatteDecompilerShader* shader, LatteConst::ShaderType shaderType)
+{
+	const sint32 samplerBaseIndex = LatteDecompiler_getTextureSamplerBaseIndex(shaderType);
+	for (uint8 i = 0; i < shader->textureUnitListCount; i++)
+	{
+		uint16 stageSamplerIndex = shader->textureUnitSamplerAssignment[shader->textureUnitList[i]];
+		sint32 lodBias = 0;
+		if (stageSamplerIndex != LATTE_DECOMPILER_SAMPLER_NONE)
+			lodBias = LatteGPUState.contextNew.SQ_TEX_SAMPLER[stageSamplerIndex + samplerBaseIndex].WORD1.get_LOD_BIAS();
+		auxHash = std::rotl<uint64>(auxHash, 7);
+		auxHash += (uint64)(uint16)lodBias;
+	}
+	return auxHash;
+}
+#endif
+
+uint64 LatteSHRC_CalcVSAuxHash(LatteDecompilerShader* vertexShader, uint32* contextRegisters, bool includeBackendExtensions)
 {
 	// todo - include texture types in aux hash similar to how it is already done in pixel shader
 	//        or maybe there is a way to figure out the proper texture types?
@@ -626,7 +657,21 @@ uint64 LatteSHRC_CalcVSAuxHash(LatteDecompilerShader* vertexShader, uint32* cont
 		}
 	}
 
-	return auxHash + auxHashTex;
+	uint64 vsAuxHash = auxHash + auxHashTex;
+
+	// The value up to this point is the upstream (backend-independent) aux hash, which is what
+	// graphic-pack shader files are named after. Capture it before the backend extensions below,
+	// exactly like LatteSHRC_CalcPSAuxHash does - otherwise the pack lookup falls back to the
+	// extended hash and vertex shader packs stop matching on Metal entirely
+	vertexShader->packAuxHash = vsAuxHash;
+	if (!includeBackendExtensions)
+		return vsAuxHash;
+
+#ifdef ENABLE_METAL
+	if (g_renderer->GetType() == RendererAPI::Metal)
+		vsAuxHash = _MtlAuxHashExtendSamplerLodBias(vsAuxHash, vertexShader, LatteConst::ShaderType::Vertex);
+#endif
+	return vsAuxHash;
 }
 
 uint64 LatteSHRC_CalcGSAuxHash(LatteDecompilerShader* geometryShader)
@@ -635,7 +680,209 @@ uint64 LatteSHRC_CalcGSAuxHash(LatteDecompilerShader* geometryShader)
 	return 0;
 }
 
-uint64 LatteSHRC_CalcPSAuxHash(LatteDecompilerShader* pixelShader, uint32* contextRegisters)
+// Defined in LatteTextureLegacy.cpp
+Latte::E_GX2SURFFMT LatteTexture_ReconstructGX2Format(const Latte::LATTE_SQ_TEX_RESOURCE_WORD1_N& texUnitWord1, const Latte::LATTE_SQ_TEX_RESOURCE_WORD4_N& texUnitWord4);
+
+#ifdef ENABLE_METAL
+// Framebuffer-fetch safety check: resolve the views that the color attachment and the sampled
+// texture unit would resolve to, using the exact same derivations as the real paths
+// (LatteMRT::GetColorAttachmentTexture / LatteTexture_updateTexturesForStage) but read-only -
+// no creation, no side effects. Returns nullptr when either side has no view yet.
+
+// Mirrors LatteMRT::GetColorAttachmentTexture's address/dimension decoding (including the
+// scissor-based resolution heuristic) and resolves the attachment view via lookupSliceEx
+static LatteTextureView* MtlResolveColorBufferViewForFetchCheck(sint32 colorBufferIndex, const uint32* contextRegisters, const struct LatteContextRegister& lcr)
+{
+	const uint32* colorBufferRegBase = contextRegisters + (mmCB_COLOR0_BASE + colorBufferIndex);
+	uint32 regColorBufferBase = colorBufferRegBase[0] & 0xFFFFFF00; // the low 8 bits are ignored? How to Survive seems to rely on this
+	uint32 regColorSize = colorBufferRegBase[mmCB_COLOR0_SIZE - mmCB_COLOR0_BASE];
+	uint32 regColorInfo = colorBufferRegBase[mmCB_COLOR0_INFO - mmCB_COLOR0_BASE];
+	uint32 regColorView = colorBufferRegBase[mmCB_COLOR0_VIEW - mmCB_COLOR0_BASE];
+
+	auto colorBufferTileMode = (Latte::E_HWTILEMODE)((regColorInfo >> 8) & 0xF);
+	MPTR colorBufferPhysMem = regColorBufferBase;
+	if (Latte::TM_IsMacroTiled(colorBufferTileMode))
+		colorBufferPhysMem &= ~(7 << 8);
+
+	uint32 viewFirstSlice = (regColorView & 0x7FF);
+	uint32 colorBufferPitch = (((regColorSize >> 0) & 0x3FF) + 1) << 3;
+	uint32 pitchHeight = (((regColorSize >> 10) & 0xFFFFF) + 1) << 6;
+	uint32 colorBufferHeight = pitchHeight / colorBufferPitch;
+	uint32 colorBufferWidth = colorBufferPitch;
+
+	// colorbuffer width/height has to be padded to 8/32 alignment but the actual resolution might be smaller
+	// use the scissor box as a clue to figure out the original resolution if possible (same heuristic as GetColorAttachmentTexture)
+	if (LatteGPUState.allowFramebufferSizeOptimization)
+	{
+		uint32 scissorBoxWidth = lcr.PA_SC_GENERIC_SCISSOR_BR.get_BR_X();
+		uint32 scissorBoxHeight = lcr.PA_SC_GENERIC_SCISSOR_BR.get_BR_Y();
+		if (((scissorBoxWidth + 7) & ~7) == colorBufferWidth)
+			colorBufferWidth = scissorBoxWidth;
+		if (((colorBufferHeight + 31) & ~31) == colorBufferHeight)
+			colorBufferHeight = scissorBoxHeight;
+	}
+
+	Latte::E_GX2SURFFMT colorBufferFormat = LatteMRT::GetColorBufferFormat(colorBufferIndex, lcr);
+	return LatteTextureViewLookupCache::lookupSliceEx(colorBufferPhysMem, colorBufferWidth, colorBufferHeight, colorBufferPitch, 0, viewFirstSlice, colorBufferFormat, false);
+}
+
+// Mirrors LatteTexture_updateTexturesForStage's texture-unit decoding (the caller guarantees
+// DIM_2D and LAST_LEVEL == 0, so the view is a single-mip view at BASE_LEVEL) and resolves the
+// sampled view via the same lookup the bind path uses
+static LatteTextureView* MtlResolveSampledViewForFetchCheck(const _LatteRegisterSetTextureUnit& texRegister)
+{
+	MPTR physAddr = (texRegister.word2.get_BASE_ADDRESS() << 8);
+	if (physAddr == MPTR_NULL)
+		return nullptr;
+
+	const auto word0 = texRegister.word0;
+	uint32 pitch = (word0.get_PITCH() + 1) << 3;
+	uint32 width = word0.get_WIDTH() + 1;
+	uint32 depth = texRegister.word1.get_DEPTH();
+	if (depth == 0)
+		depth = 1;
+	uint32 height = texRegister.word1.get_HEIGHT() + 1;
+	if (Latte::IsCompressedFormat(texRegister.word1.get_DATA_FORMAT()))
+		pitch /= 4;
+
+	const auto word5 = texRegister.word5;
+	uint32 viewFirstSlice = word5.get_BASE_ARRAY();
+	uint32 viewNumSlices = word5.get_LAST_ARRAY() + 1 - viewFirstSlice;
+
+	if (Latte::TM_IsMacroTiled(word0.get_TILE_MODE()))
+		physAddr &= ~0x700;
+
+	Latte::E_GX2SURFFMT format = LatteTexture_ReconstructGX2Format(texRegister.word1, texRegister.word4);
+	return LatteTextureViewLookupCache::lookup(physAddr, width, height, depth, pitch, 0, 1, viewFirstSlice, viewNumSlices, format, Latte::E_DIM::DIM_2D);
+}
+#endif
+
+void LatteShader_CalcPSRenderTargetIndices(const LatteDecompilerShader* pixelShader, uint64 pixelShaderBaseHash, const uint32* contextRegisters, const struct _LatteRegisterSetTextureUnit* texRegs, const struct LatteContextRegister& lcr, uint8* textureRenderTargetIndex)
+{
+	for (sint32 i = 0; i < LATTE_NUM_MAX_TEX_UNITS; i++)
+		textureRenderTargetIndex[i] = 255;
+
+	// build the list of active color buffers (same criteria as the render target update)
+	struct
+	{
+		sint32 index;
+		MPTR physAddr;
+		Latte::E_GX2SURFFMT format;
+		Latte::E_HWTILEMODE tileMode;
+	} colorBuffers[LATTE_NUM_COLOR_TARGET]{};
+
+	uint8 colorBufferMask = LatteMRT::GetActiveColorBufferMask(pixelShader, lcr);
+	sint32 colorBufferCount = 0;
+	for (sint32 i = 0; i < LATTE_NUM_COLOR_TARGET; i++)
+	{
+		auto& colorBuffer = colorBuffers[colorBufferCount];
+		if (((colorBufferMask) & (1 << i)) == 0)
+			continue; // color buffer not enabled
+
+		const uint32* colorBufferRegBase = contextRegisters + (mmCB_COLOR0_BASE + i);
+		uint32 regColorBufferBase = colorBufferRegBase[0] & 0xFFFFFF00; // the low 8 bits are ignored? How to Survive seems to rely on this
+		uint32 regColorInfo = colorBufferRegBase[mmCB_COLOR0_INFO - mmCB_COLOR0_BASE];
+
+		MPTR colorBufferPhysMem = regColorBufferBase;
+		Latte::E_HWTILEMODE colorBufferTileMode = (Latte::E_HWTILEMODE)((regColorInfo >> 8) & 0xF);
+
+		Latte::E_GX2SURFFMT colorBufferFormat = LatteMRT::GetColorBufferFormat(i, lcr);
+
+		colorBuffer = { i, colorBufferPhysMem, colorBufferFormat, colorBufferTileMode };
+		colorBufferCount++;
+	}
+
+	for (sint32 i = 0; i < pixelShader->textureUnitListCount; i++)
+	{
+		sint32 textureIndex = pixelShader->textureUnitList[i];
+		const auto& texRegister = texRegs[textureIndex];
+
+		// get physical address of texture data
+		MPTR physAddr = (texRegister.word2.get_BASE_ADDRESS() << 8);
+		if (physAddr == MPTR_NULL)
+			continue; // invalid data
+
+		auto tileMode = texRegister.word0.get_TILE_MODE();
+
+		// Check for dimension
+		auto dim = pixelShader->textureUnitDim[textureIndex];
+		// TODO: 2D arrays could be supported as well
+		if (dim != Latte::E_DIM::DIM_2D)
+			continue;
+
+		// Check for mip level
+		auto lastMip = texRegister.word5.get_LAST_LEVEL();
+		// TODO: multiple mip levels could be supported as well
+		if (lastMip != 0)
+			continue;
+
+		Latte::E_GX2SURFFMT format = LatteTexture_ReconstructGX2Format(texRegister.word1, texRegister.word4);
+
+		// Check if the texture is used as render target
+		for (sint32 j = 0; j < colorBufferCount; j++)
+		{
+			const auto& colorBuffer = colorBuffers[j];
+
+			if (physAddr == colorBuffer.physAddr && format == colorBuffer.format && tileMode == colorBuffer.tileMode)
+			{
+#ifdef ENABLE_METAL
+				if (g_renderer && g_renderer->GetType() == RendererAPI::Metal
+					&& static_cast<MetalRenderer*>(g_renderer.get())->SupportsFramebufferFetch())
+				{
+					// A graphic pack shader that samples this unit as a regular texture
+					// (Vulkan-style) must not have it classified as a framebuffer-fetch source:
+					// the translated pack MSL binds it via the normal texture mapping, and
+					// leaving it classified would both exclude the unit from the resource
+					// mapping (no binding for the pack shader) and make the bind site skip it.
+					// The classification - and therefore the aux hash - is suppressed for exactly
+					// those units, so MSL, mapping and hash stay consistent. Same-pass reads are
+					// served by the feedback-loop shadow copies, matching Vulkan's dataflow
+					if (MetalShaderTranslator_PackShaderSamplesTextureUnit(pixelShaderBaseHash, (uint8)textureIndex))
+					{
+						textureRenderTargetIndex[textureIndex] = 255;
+						break;
+					}
+					// The framebuffer-fetch substitution reads col{N} - the color attachment as
+					// currently bound. That is only equivalent to sampling the texture when the
+					// game's texture unit resolves to the exact same view (same surface
+					// definition, mip 0, slice). Same-address aliased surfaces with different
+					// definitions (e.g. SM3DW pre-mipmapping its DoF buffer: the sampled
+					// definition is a single-mip view while the attachment covers another mip of
+					// a larger surface) resolve to different view objects despite
+					// register-identical matches. Those units take the texture-binding path
+					// (feedback-loop shadow copies - Vulkan's dataflow) instead
+					// Depth-compare samples on the substituted attachment are also unsupported
+					// (the substitution would ignore the comparison) - serve them from shadow
+					// copies which handle compare sampling correctly
+					if (pixelShader->textureUsesDepthCompare[textureIndex])
+					{
+						textureRenderTargetIndex[textureIndex] = 255;
+						break;
+					}
+					LatteTextureView* attachmentView = MtlResolveColorBufferViewForFetchCheck(colorBuffer.index, contextRegisters, lcr);
+					LatteTextureView* sampledView = MtlResolveSampledViewForFetchCheck(texRegister);
+					if (texRegister.word4.get_BASE_LEVEL() != 0 || attachmentView != sampledView || !attachmentView)
+					{
+						static std::atomic<uint32> s_fetchDenyLogCount{ 0 };
+						if (s_fetchDenyLogCount.fetch_add(1) < 8)
+							cemuLog_log(LogType::Force, "LatteShader: texture unit {} not classified as framebuffer-fetch source (sampled view differs from the color attachment or views not created yet), reads served via texture binding", (int)textureIndex);
+						textureRenderTargetIndex[textureIndex] = 255;
+						break;
+					}
+				}
+#endif
+				textureRenderTargetIndex[textureIndex] = colorBuffer.index;
+				break;
+			}
+		}
+	}
+}
+
+// includeBackendExtensions: the Metal extension block below reads the LIVE renderer register
+// state (LatteGPUState.contextNew), which is only valid from the render thread. The shader-cache
+// restore path runs on the loader thread and discards the extended result (only packAuxHash is
+// needed there), so it passes false to skip both the wasted work and the racy read
+uint64 LatteSHRC_CalcPSAuxHash(LatteDecompilerShader* pixelShader, uint32* contextRegisters, bool includeBackendExtensions = true)
 {
 	uint64 auxHash = 0;
 	// CB_SHADER_MASK can remap pixel shader outputs
@@ -660,16 +907,36 @@ uint64 LatteSHRC_CalcPSAuxHash(LatteDecompilerShader* pixelShader, uint32* conte
 		auxHash += (uint64)dim;
 	}
 
+	// The value up to this point is the upstream (backend-independent) aux hash. It is what
+	// graphic-pack shader files are named after, so keep it available for pack lookups.
+	// The Metal extensions below are appended AFTER packAuxHash is captured, so the extended
+	// auxHash stays byte-identical to the pre-split value and all Metal caches remain valid.
+	pixelShader->packAuxHash = auxHash;
+	if (!includeBackendExtensions)
+		return auxHash;
+
 #ifdef ENABLE_METAL
 	if (g_renderer->GetType() == RendererAPI::Metal)
 	{
-		// Textures as render targets
+		// Textures as render targets. The classification is evaluated against the CURRENT register
+		// state rather than the shader's stored textureRenderTargetIndex: this hash is recomputed
+		// on shader-state-cache hits with the live registers, and the stored indices are a
+		// decompile-time snapshot. A variant compiled for an MRT draw (framebuffer fetch of an
+		// attached buffer) would otherwise also be selected for a depth-only draw of the same
+		// shader (target mask off), where the fetch's [[color(N)]] input has no matching
+		// attachment and pipeline creation fails. At decompile time this yields the same values
+		// the analyzer just stored, so compiled-shader aux hashes are unchanged
+		uint8 renderTargetIndices[LATTE_NUM_MAX_TEX_UNITS];
+		LatteShader_CalcPSRenderTargetIndices(pixelShader, pixelShader->baseHash, contextRegisters, LatteGPUState.contextNew.SQ_TEX_START_PS, LatteGPUState.contextNew, renderTargetIndices);
 		for (uint32 i = 0; i < pixelShader->textureUnitListCount; i++)
 		{
 		    uint8 t = pixelShader->textureUnitList[i];
 		    auxHash = std::rotl<uint64>(auxHash, 11);
-			auxHash += (uint64)pixelShader->textureRenderTargetIndex[t];
+			auxHash += (uint64)renderTargetIndices[t];
 		}
+
+		// sampler LOD_BIAS (baked into the emitted MSL - see _MtlAuxHashExtendSamplerLodBias)
+		auxHash = _MtlAuxHashExtendSamplerLodBias(auxHash, pixelShader, LatteConst::ShaderType::Pixel);
 
 		// Color buffers
         for (uint8 i = 0; i < LATTE_NUM_COLOR_TARGET; i++)
@@ -767,7 +1034,7 @@ LatteDecompilerShader* LatteShader_CreateShaderFromDecompilerOutput(LatteDecompi
 	{
 		if (decompilerOutput.shaderType == LatteConst::ShaderType::Vertex)
 		{
-			uint64 vsAuxHash = LatteSHRC_CalcVSAuxHash(shader, contextRegister);
+			uint64 vsAuxHash = LatteSHRC_CalcVSAuxHash(shader, contextRegister, true);
 			shader->auxHash = vsAuxHash;
 		}
 		else if (decompilerOutput.shaderType == LatteConst::ShaderType::Geometry)
@@ -785,8 +1052,28 @@ LatteDecompilerShader* LatteShader_CreateShaderFromDecompilerOutput(LatteDecompi
 	}
 	else
 	{
+		// shader restored from the transferable cache: the (possibly backend-extended) aux hash
+		// comes from the cache entry, but the upstream-parity hash used for graphic-pack matching
+		// is not serialized, so recompute it from the restored context register state. This runs
+		// on the loader thread, so the backend extensions (which read live GPU state) are skipped.
+		// The non-pixel stages must recompute it too - assigning optionalAuxHash here would hand
+		// the backend-extended hash to the pack lookup
+		if (decompilerOutput.shaderType == LatteConst::ShaderType::Pixel)
+			LatteSHRC_CalcPSAuxHash(shader, contextRegister, false);
+		else if (decompilerOutput.shaderType == LatteConst::ShaderType::Vertex)
+			LatteSHRC_CalcVSAuxHash(shader, contextRegister, false);
+		else
+			shader->packAuxHash = optionalAuxHash;
 		shader->auxHash = optionalAuxHash;
 	}
+#ifdef ENABLE_METAL
+	// Hook for Metal graphic-pack custom shader translation (GLSL -> MSL).
+	// Must run after auxHash is final (pack lookup uses it) and before CleanupAfterCompile
+	// frees strBuf_shaderSource. Covers both fresh compiles and shader-cache restores,
+	// which funnel through this function. See MetalShaderTranslator.cpp for details.
+	if (g_renderer->GetType() == RendererAPI::Metal)
+		MetalShaderTranslator_PrepareGraphicPackShader(*shader, decompilerOutput);
+#endif
 	return shader;
 }
 
@@ -960,7 +1247,7 @@ LatteDecompilerShader* LatteSHRC_GetOrCreateVertexShader(uint8* vertexShaderPtr,
 	LatteDecompilerShader* vertexShader = nullptr;
 	if (itBaseShader != sVertexShaders.end())
 	{
-		vsAuxHash = LatteSHRC_CalcVSAuxHash(itBaseShader->second, LatteGPUState.contextRegister);
+		vsAuxHash = LatteSHRC_CalcVSAuxHash(itBaseShader->second, LatteGPUState.contextRegister, true);
 		vertexShader = LatteSHRC_GetFromChain(itBaseShader->second, _shaderBaseHash_vs, vsAuxHash);
 	}
 	if (!vertexShader)
@@ -1065,7 +1352,7 @@ robin_hood::unordered_flat_map<uint64, ShaderStateInfo, ShaderStateDirectHash> s
 
 FORCE_INLINE uint64 CalcCombinedAuxHash(LatteFetchShader* fetchShader, LatteDecompilerShader* vertexShader, LatteDecompilerShader* pixelShader)
 {
-	uint64 vsAuxHash = vertexShader ? LatteSHRC_CalcVSAuxHash(vertexShader, LatteGPUState.contextRegister) : 0;
+	uint64 vsAuxHash = vertexShader ? LatteSHRC_CalcVSAuxHash(vertexShader, LatteGPUState.contextRegister, true) : 0;
 	uint64 psAuxHash = pixelShader ? LatteSHRC_CalcPSAuxHash(pixelShader, LatteGPUState.contextRegister) : 0;
 	uint64 combinedAuxHash = vsAuxHash + mix64(psAuxHash);
 #ifdef ENABLE_METAL

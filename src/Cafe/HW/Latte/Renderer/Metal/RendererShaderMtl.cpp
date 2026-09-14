@@ -1,6 +1,8 @@
 #include "Cafe/HW/Latte/Renderer/Metal/RendererShaderMtl.h"
 #include "Cafe/HW/Latte/Renderer/Metal/MetalRenderer.h"
 #include "Cafe/HW/Latte/Renderer/Metal/MetalCommon.h"
+#include "Cafe/HW/Latte/Renderer/Metal/MetalShaderTranslator.h"
+#include "Cafe/HW/Latte/Renderer/Metal/MetalDiagnostics.h"
 
 //#include "Cemu/FileCache/FileCache.h"
 //#include "config/ActiveSettings.h"
@@ -189,6 +191,10 @@ void RendererShaderMtl::ShaderCacheLoading_end()
 
 void RendererShaderMtl::ShaderCacheLoading_Close()
 {
+	// flush and close the translated graphic pack shader cache (mirrors the Vulkan backend
+	// closing s_spirvCache here)
+	MetalShaderTranslator_CloseCache();
+
     // Close the AIR cache
     /*
     if (s_airCache)
@@ -229,6 +235,13 @@ RendererShaderMtl::~RendererShaderMtl()
 {
     if (m_function)
         m_function->release();
+    // the stripped-variant functions each retain their compiled library - releasing them here
+    // prevents an accumulation across shader-cache evictions
+    for (auto& [key, function] : m_strippedFunctionCache)
+    {
+        if (function)
+            function->release();
+    }
 }
 
 void RendererShaderMtl::PreponeCompilation(bool isRenderThread)
@@ -245,7 +258,11 @@ void RendererShaderMtl::PreponeCompilation(bool isRenderThread)
 	if (!isStillQueued)
 	{
 		m_compilationState.waitUntilValue(COMPILATION_STATE::DONE);
-		if (ShouldCountCompilation())
+		// count the stall only once per shader - PreponeCompilation can be called again after
+		// the shader is already done (e.g. by another pipeline reusing it) and would otherwise
+		// drive the counter negative
+		bool expected = false;
+		if (ShouldCountCompilation() && m_preponeCounted.compare_exchange_strong(expected, true))
 		    --g_compiled_shaders_async; // compilation caused a stall so we don't consider this one async
 		return;
 	}
@@ -277,8 +294,17 @@ MTL::Library* RendererShaderMtl::LibraryFromSource()
 {
     // Compile from source
     NS_STACK_SCOPED MTL::CompileOptions* options = MTL::CompileOptions::alloc()->init();
-    if (g_current_game_profile->GetShaderFastMath())
-        options->setFastMathEnabled(true);
+    // Fast-math must stay off: Metal's CompileOptions default to fast-math enabled, but the
+    // Vulkan reference path (GLSL -> SPIR-V) preserves FMul/FAdd order and rounding. Fast-math
+    // reassociates float expressions, contracts a*b+c and approximates 1.0/x (the decompiler
+    // emits RECIP_IEEE verbatim), which shifts low-order bits per pixel and visibly diverges in
+    // effect chains (DoF/bloom dither). It can also legally simplify the a==0.0 || b==0.0 guard
+    // the mul_nonIEEE emulation relies on.
+    // Note: the shaderFastMath game-profile option is intentionally NOT honored here. No other
+    // backend consumes it (SPIR-V preserves IEEE semantics unconditionally) and it defaults to
+    // true, so honoring it would disable exactly the IEEE parity this line enforces. If the
+    // option is ever wired into the Vulkan path, revisit
+    options->setFastMathEnabled(false);
 
     if (m_mtlr->GetPositionInvariance())
     {
@@ -291,6 +317,7 @@ MTL::Library* RendererShaderMtl::LibraryFromSource()
 	if (error)
     {
         cemuLog_log(LogType::Force, "failed to create library from source: {} -> {}", error->localizedDescription()->utf8String(), m_mslCode.c_str());
+        m_hasError = true;
         return nullptr;
     }
 
@@ -353,6 +380,8 @@ void RendererShaderMtl::CompileInternal()
     }
 
     m_function = library->newFunction(ToNSString("main0"));
+    if (!m_function)
+        m_hasError = true; // pipeline compiler fails the pipeline early via HasError()
     library->release();
 
 	// Count shader compilation
@@ -400,8 +429,194 @@ void RendererShaderMtl::CompileToAIR()
 }
 */
 
+MTL::Function* RendererShaderMtl::GetStrippedVariant(uint32 removedColorMask, bool removeDepth)
+{
+	// bit 8 of the cache key signals depth removal (color masks only use bits 0..7)
+	const uint32 cacheKey = removedColorMask | (removeDepth ? 0x100 : 0);
+	std::lock_guard<std::mutex> lock(m_variantMutex);
+	auto it = m_strippedFunctionCache.find(cacheKey);
+	if (it != m_strippedFunctionCache.end())
+		return it->second;
+
+	// Only rewrite sources this project's decompiler emitted (see kMslDecompilerSourceMarker). A
+	// translated graphic-pack shader is SPIRV-Cross output: its members carry the same
+	// passPixelColorN names, so the member scan below matches and removes them from a struct it does
+	// not own, but the "FragmentOut out;" anchor and the "struct FragmentOut {" check both miss -
+	// so the return statement of a function that still returns main0_out gets rewritten to "return;"
+	// and the result cannot compile. Refuse up front instead, and let the diagnostics say that this
+	// shader cannot be served on a pass it has orphan outputs for
+	if (m_mslCode.find(kMslDecompilerSourceMarker) == std::string::npos)
+	{
+		MetalDiag_Count(MetalDiagEvent::OrphanOutputStripUnsupported,
+			"{:016x}_{:016x} (colorMask {:05x}, depth {})", m_baseHash, m_auxHash, removedColorMask, removeDepth ? 1 : 0);
+		return nullptr;
+	}
+
+	// remove the FragmentOut members for the orphaned outputs from the MSL source. The emitter
+	// writes color outputs as "<type> passPixelColor<N> [[color(N)]];" and the depth output as
+	// "float passDepth [[depth(any)]];". Metal requires every member of a fragment return
+	// struct to carry an output attribute, so simply stripping the attribute is not enough -
+	// the member must be removed from the struct entirely. The body's out.passPixelColor<N> /
+	// out.passDepth references are redirected to dummy locals so the assignments (and any
+	// reads) still compile with identical semantics
+	struct RemovedMember
+	{
+		std::string type;
+		uint32 index;
+	};
+	std::vector<RemovedMember> removedMembers;
+	bool depthMemberRemoved = false;
+	std::string patchedSource;
+	patchedSource.reserve(m_mslCode.size());
+	size_t lineStart = 0;
+	while (lineStart <= m_mslCode.size())
+	{
+		size_t lineEnd = m_mslCode.find('\n', lineStart);
+		if (lineEnd == std::string::npos)
+			lineEnd = m_mslCode.size();
+		std::string_view line((const char*)m_mslCode.data() + lineStart, lineEnd - lineStart);
+		bool memberRemoved = false;
+		for (uint32 i = 0; i < 8; i++)
+		{
+			if ((removedColorMask & (1u << i)) == 0)
+				continue;
+			if (line.find(fmt::format("passPixelColor{} [[color({})]];", i, i)) != std::string_view::npos)
+			{
+				// capture the member type (first token of the line) for the dummy declaration
+				size_t typeEnd = line.find_first_of(" \t");
+				removedMembers.push_back({ std::string(line.substr(0, typeEnd)), i });
+				memberRemoved = true; // one member per line, no further matching needed
+				break;
+			}
+		}
+		if (!memberRemoved && removeDepth && line.find("float passDepth [[depth(any)]];") != std::string_view::npos)
+		{
+			depthMemberRemoved = true;
+			memberRemoved = true;
+		}
+		if (!memberRemoved)
+			patchedSource.append(line);
+		if (lineEnd == m_mslCode.size())
+			break;
+		patchedSource.push_back('\n');
+		lineStart = lineEnd + 1;
+	}
+
+	if (removedMembers.empty() && !depthMemberRemoved)
+	{
+		// nothing matched - this source is not decompiled MSL (e.g. a translated graphic-pack
+		// shader with different symbol names), so stripping is not applicable. Return nullptr
+		// without caching: the text scan is cheap and the caller falls back to the original
+		// function
+		return nullptr;
+	}
+
+	if (!removedMembers.empty())
+	{
+		for (const auto& member : removedMembers)
+		{
+			const std::string ref = fmt::format("out.passPixelColor{}", member.index);
+			const std::string dummy = fmt::format("orphanColor{}", member.index);
+			size_t refPos;
+			while ((refPos = patchedSource.find(ref)) != std::string::npos)
+				patchedSource.replace(refPos, ref.size(), dummy);
+		}
+	}
+	if (depthMemberRemoved)
+	{
+		const std::string ref = "out.passDepth";
+		const std::string dummy = "orphanDepth";
+		size_t refPos;
+		while ((refPos = patchedSource.find(ref)) != std::string::npos)
+			patchedSource.replace(refPos, ref.size(), dummy);
+	}
+	// declare the dummies right after the local FragmentOut variable in main0, which the
+	// emitter always emits for pixel shaders; all out.* uses come after it
+	{
+		std::string dummies;
+		for (const auto& member : removedMembers)
+			dummies += fmt::format("\n\t{} orphanColor{};", member.type, member.index);
+		if (depthMemberRemoved)
+			dummies += "\n\tfloat orphanDepth;";
+		if (!dummies.empty())
+		{
+			const std::string outDecl = "FragmentOut out;";
+			size_t declPos = patchedSource.find(outDecl);
+			if (declPos != std::string::npos)
+				patchedSource.insert(declPos + outDecl.size(), dummies);
+		}
+	}
+
+	// if the FragmentOut struct no longer carries any color or depth output, Metal rejects it
+	// as a fragment return type ("invalid return type"). Switch to a void-returning function;
+	// the local FragmentOut variable and its assignments stay (harmless dead stores). The
+	// check is scoped to the struct because [[color(N)]] may legitimately remain elsewhere in
+	// the source (e.g. a framebuffer-fetch input argument)
+	{
+		bool structHasOutputs = false;
+		size_t structPos = patchedSource.find("struct FragmentOut {");
+		if (structPos != std::string::npos)
+		{
+			size_t structEnd = patchedSource.find("\n};", structPos);
+			if (structEnd == std::string::npos)
+				structEnd = patchedSource.size();
+			std::string_view structBody((const char*)patchedSource.data() + structPos, structEnd - structPos);
+			structHasOutputs = structBody.find("[[color(") != std::string_view::npos || structBody.find("[[depth") != std::string_view::npos;
+		}
+		if (!structHasOutputs)
+		{
+			const std::string sigOld = "FragmentOut main0(";
+			size_t sigPos = patchedSource.find(sigOld);
+			if (sigPos != std::string::npos)
+				patchedSource.replace(sigPos, sigOld.size(), "void main0(");
+			size_t retPos;
+			while ((retPos = patchedSource.find("return out;")) != std::string::npos)
+				patchedSource.replace(retPos, 10, "return;");
+		}
+	}
+
+	// compile the variant with the same options as the primary compilation. The explicit
+	// autorelease pool is required: this may run on pipeline-compile threads which have no
+	// ObjC autorelease pool (an imbalance crashes at thread exit)
+	MTL::Function* function = nullptr;
+	{
+		NS::AutoreleasePool* autoreleasePool = NS::AutoreleasePool::alloc()->init();
+		NS_STACK_SCOPED MTL::CompileOptions* options = MTL::CompileOptions::alloc()->init();
+		// must match LibraryFromSource - fast-math stays off on the Vulkan-parity path
+		options->setFastMathEnabled(false);
+		if (m_mtlr->GetPositionInvariance())
+			options->setPreserveInvariance(true);
+
+		NS::Error* error = nullptr;
+		MTL::Library* library = m_mtlr->GetDevice()->newLibrary(ToNSString(patchedSource), options, &error);
+		if (!library)
+		{
+			cemuLog_log(LogType::Force, "failed to compile output-stripped fragment variant of shader {:016x}_{:016x} (colorMask {:05x} depth {}) : {}",
+				m_baseHash, m_auxHash, removedColorMask, removeDepth ? 1 : 0, error ? error->localizedDescription()->utf8String() : "unknown error");
+			// note: the out-param error is autoreleased (metal-cpp does not retain it) - do not
+			// release it here, the autorelease pool owns its lifetime
+			// cache the failure so a broken variant is not recompiled on every draw
+			m_strippedFunctionCache.emplace(cacheKey, nullptr);
+			autoreleasePool->release();
+			return nullptr;
+		}
+
+		function = library->newFunction(ToNSString("main0"));
+		library->release(); // the function retains the library
+		autoreleasePool->release();
+	}
+	m_strippedFunctionCache.emplace(cacheKey, function);
+	return function;
+}
+
 void RendererShaderMtl::FinishCompilation()
 {
-    m_mslCode.clear();
-    m_mslCode.shrink_to_fit();
+    // retain the MSL source of pixel shaders: the pipeline compiler may need stripped-output
+    // variants of the fragment function (see GetStrippedVariant). Vertex and
+    // geometry shaders have no color outputs - free their source
+    if (m_type != ShaderType::kFragment)
+    {
+        m_mslCode.clear();
+        m_mslCode.shrink_to_fit();
+    }
 }

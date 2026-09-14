@@ -144,6 +144,12 @@ struct LatteDecompilerShader
 	LatteConst::ShaderType shaderType;
 	uint64 baseHash{0};
 	uint64 auxHash{0};
+	// Aux hash without backend-specific extensions. The Metal backend folds render-target
+	// texture indices, color buffer formats and depth presence into auxHash to distinguish
+	// shader variants (framebuffer-fetch MSL emission depends on them), which makes
+	// (baseHash, auxHash) unmatchable against graphic-pack shader files authored for the
+	// upstream/Vulkan hash. Pack lookups must use this field instead.
+	uint64 packAuxHash{0};
 	// vertex shader
 	struct LatteFetchShader* compatibleFetchShader{};
 	// error tracking
@@ -281,6 +287,12 @@ struct LatteDecompilerOutput_t
 	LatteDecompilerShaderResourceMapping resourceMappingGL;
 	LatteDecompilerShaderResourceMapping resourceMappingVK;
 	LatteDecompilerShaderResourceMapping resourceMappingMTL;
+
+	// Metal structural path info. Exported by the MSL emitter (LatteDecompiler_emitMSLShader) from the
+	// same context state that shaped the emitted shader source, so consumers (MetalShaderTranslator)
+	// can branch on the actual emitted configuration instead of re-deriving it. Only valid when the
+	// active renderer is Metal.
+	bool fetchVertexManually{ false }; // vertex fetch happens inside the vertex shader (no vertex attributes)
 };
 
 struct LatteDecompilerSubroutineInfo;

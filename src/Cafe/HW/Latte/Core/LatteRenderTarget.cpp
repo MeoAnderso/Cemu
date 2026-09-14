@@ -230,6 +230,9 @@ LatteTextureView* LatteMRT_CreateDepthBuffer(MPTR depthBufferPhysMem, uint32 wid
 
 sint32 _depthBufferSizeWarningCount = 0;
 
+// NOTE: the Metal backend has a read-only mirror of this address/dimension decoding in
+// LatteShader.cpp (MtlResolveColorBufferViewForFetchCheck) - keep both in sync when changing
+// the buffer-base/size derivation or the scissor-based resolution heuristic
 LatteTextureView* LatteMRT::GetColorAttachmentTexture(uint32 index, bool createNew, bool checkForTextureChanges)
 {
 	uint32* colorBufferRegBase = LatteGPUState.contextRegister+(mmCB_COLOR0_BASE + index);

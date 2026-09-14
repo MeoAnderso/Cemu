@@ -31,13 +31,16 @@ private:
     std::map<uint64, PipelineObject*> m_pipelineCache;
     FSpinlock m_pipelineCacheLock;
 
-	std::thread* m_pipelineCacheStoreThread;
+	std::thread* m_pipelineCacheStoreThread{ nullptr };
+	// set by StopStoreThread to retire the writer thread. The thread calls back into this object,
+	// so it is joined before the object goes away - see StopStoreThread. It must stay joinable
+	// (never detach it) or that join silently becomes a no-op
+	std::atomic_bool m_storeThreadStop{ false };
 
-	class FileCache* s_cache;
+	class FileCache* s_cache{ nullptr };
 
 	std::atomic_uint32_t m_numCompilationThreads{ 0 };
 	ConcurrentQueue<std::vector<uint8>> m_compilationQueue;
-	std::atomic_uint32_t m_compilationCount;
 
     static uint64 CalculatePipelineHash(const LatteFetchShader* fetchShader, const LatteDecompilerShader* vertexShader, const LatteDecompilerShader* geometryShader, const LatteDecompilerShader* pixelShader, const class MetalAttachmentsInfo& lastUsedAttachmentsInfo, const class MetalAttachmentsInfo& activeAttachmentsInfo, const LatteContextRegister& lcr);
 
@@ -49,4 +52,6 @@ private:
 
     int CompilerThread();
 	void WorkerThread();
+	void StopStoreThread();
+	void DiscardPendingJobs();
 };

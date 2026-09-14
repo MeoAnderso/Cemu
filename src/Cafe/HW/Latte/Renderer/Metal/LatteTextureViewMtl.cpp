@@ -3,6 +3,7 @@
 #include "Cafe/HW/Latte/Renderer/Metal/MetalRenderer.h"
 #include "Cafe/HW/Latte/Renderer/Metal/LatteToMtl.h"
 #include "Metal/MTLTexture.hpp"
+#include <atomic>
 
 uint32 LatteTextureMtl_AdjustTextureCompSel(Latte::E_GX2SURFFMT format, uint32 compSel)
 {
@@ -57,7 +58,7 @@ uint32 LatteTextureMtl_AdjustTextureCompSel(Latte::E_GX2SURFFMT format, uint32 c
 LatteTextureViewMtl::LatteTextureViewMtl(MetalRenderer* mtlRenderer, LatteTextureMtl* texture, Latte::E_DIM dim, Latte::E_GX2SURFFMT format, sint32 firstMip, sint32 mipCount, sint32 firstSlice, sint32 sliceCount)
 	: LatteTextureView(texture, firstMip, mipCount, firstSlice, sliceCount, dim, format), m_mtlr(mtlRenderer), m_baseTexture(texture)
 {
-    m_rgbaView = CreateSwizzledView(RGBA_SWIZZLE);
+    m_rgbaView = CreatePlainView();
 }
 
 LatteTextureViewMtl::~LatteTextureViewMtl()
@@ -73,18 +74,17 @@ LatteTextureViewMtl::~LatteTextureViewMtl()
     {
         texture->release();
     }
+
+    for (auto& [key, texture] : m_mipClampViewCache)
+    {
+        texture->release();
+    }
 }
 
 MTL::Texture* LatteTextureViewMtl::GetSwizzledView(uint32 gpuSamplerSwizzle)
 {
     // Mask out
     gpuSamplerSwizzle &= 0x0FFF0000;
-
-    // RGBA swizzle == no swizzle
-    if (gpuSamplerSwizzle == RGBA_SWIZZLE)
-    {
-        return m_rgbaView;
-    }
 
     // First, try to find a view in the cache
 
@@ -119,9 +119,14 @@ MTL::Texture* LatteTextureViewMtl::GetSwizzledView(uint32 gpuSamplerSwizzle)
     return texture;
 }
 
-MTL::Texture* LatteTextureViewMtl::CreateSwizzledView(uint32 gpuSamplerSwizzle)
+MTL::Texture* LatteTextureViewMtl::CreatePlainView()
 {
-    uint32 compSelR = (gpuSamplerSwizzle >> 16) & 0x7;
+	return CreateViewInternal(nullptr);
+}
+
+MTL::TextureSwizzleChannels LatteTextureViewMtl::GetSwizzleChannels(Latte::E_GX2SURFFMT format, uint32 gpuSamplerSwizzle)
+{
+	uint32 compSelR = (gpuSamplerSwizzle >> 16) & 0x7;
 	uint32 compSelG = (gpuSamplerSwizzle >> 19) & 0x7;
 	uint32 compSelB = (gpuSamplerSwizzle >> 22) & 0x7;
 	uint32 compSelA = (gpuSamplerSwizzle >> 25) & 0x7;
@@ -130,6 +135,40 @@ MTL::Texture* LatteTextureViewMtl::CreateSwizzledView(uint32 gpuSamplerSwizzle)
 	compSelB = LatteTextureMtl_AdjustTextureCompSel(format, compSelB);
 	compSelA = LatteTextureMtl_AdjustTextureCompSel(format, compSelA);
 
+	MTL::TextureSwizzleChannels swizzle;
+	swizzle.red = GetMtlTextureSwizzle(compSelR);
+	swizzle.green = GetMtlTextureSwizzle(compSelG);
+	swizzle.blue = GetMtlTextureSwizzle(compSelB);
+	swizzle.alpha = GetMtlTextureSwizzle(compSelA);
+	return swizzle;
+}
+
+MTL::Texture* LatteTextureViewMtl::CreateSwizzledView(uint32 gpuSamplerSwizzle)
+{
+	MTL::TextureSwizzleChannels swizzle = GetSwizzleChannels(format, gpuSamplerSwizzle);
+	return CreateViewInternal(&swizzle);
+}
+
+MTL::Texture* LatteTextureViewMtl::GetSwizzledViewWithMipCount(uint32 gpuSamplerSwizzle, uint32 levelCount)
+{
+    // same swizzle masking as GetSwizzledView so both caches key on the identical value
+    const uint64 key = (uint64)(gpuSamplerSwizzle & 0x0FFF0000) | ((uint64)levelCount << 32);
+    auto itr = m_mipClampViewCache.find(key);
+    if (itr != m_mipClampViewCache.end())
+        return itr->second;
+    MTL::Texture* view = CreateSwizzledViewWithMipCount(gpuSamplerSwizzle, levelCount);
+    m_mipClampViewCache.emplace(key, view);
+    return view;
+}
+
+MTL::Texture* LatteTextureViewMtl::CreateSwizzledViewWithMipCount(uint32 gpuSamplerSwizzle, uint32 levelCount)
+{
+	MTL::TextureSwizzleChannels swizzle = GetSwizzleChannels(format, gpuSamplerSwizzle);
+	return CreateViewInternal(&swizzle, (sint32)levelCount);
+}
+
+MTL::Texture* LatteTextureViewMtl::CreateViewInternal(const MTL::TextureSwizzleChannels* swizzle, sint32 overrideLevelCount)
+{
 	MTL::TextureType textureType;
     switch (dim)
     {
@@ -159,6 +198,8 @@ MTL::Texture* LatteTextureViewMtl::CreateSwizzledView(uint32 gpuSamplerSwizzle)
 
     uint32 baseLevel = firstMip;
     uint32 levelCount = this->numMip;
+    if (overrideLevelCount > 0)
+        levelCount = std::min<uint32>((uint32)overrideLevelCount, this->numMip);
     uint32 baseLayer = 0;
     uint32 layerCount = 1;
     // TODO: check if base texture is 3D texture as well
@@ -174,18 +215,35 @@ MTL::Texture* LatteTextureViewMtl::CreateSwizzledView(uint32 gpuSamplerSwizzle)
             layerCount = this->numSlice;
     }
 
-    MTL::TextureSwizzleChannels swizzle;
-    swizzle.red = GetMtlTextureSwizzle(compSelR);
-    swizzle.green = GetMtlTextureSwizzle(compSelG);
-    swizzle.blue = GetMtlTextureSwizzle(compSelB);
-    swizzle.alpha = GetMtlTextureSwizzle(compSelA);
-
     // Clamp mip levels
     levelCount = std::min(levelCount, m_baseTexture->maxPossibleMipLevels - baseLevel);
     levelCount = std::max(levelCount, (uint32)1);
 
     auto pixelFormat = GetMtlPixelFormat(format, m_baseTexture->isDepth);
-    MTL::Texture* texture = m_baseTexture->GetTexture()->newTextureView(pixelFormat, textureType, NS::Range::Make(baseLevel, levelCount), NS::Range::Make(baseLayer, layerCount), swizzle);
 
-    return texture;
+    // Swizzled views are restricted to ShaderRead|PixelFormatView usage, which prevents their use as
+    // render pass attachments. Plain views inherit the full usage of the parent texture.
+    MTL::Texture* view = nullptr;
+    if (swizzle)
+        view = m_baseTexture->GetTexture()->newTextureView(pixelFormat, textureType, NS::Range::Make(baseLevel, levelCount), NS::Range::Make(baseLayer, layerCount), *swizzle);
+    else
+        view = m_baseTexture->GetTexture()->newTextureView(pixelFormat, textureType, NS::Range::Make(baseLevel, levelCount), NS::Range::Make(baseLayer, layerCount));
+
+    if (!view)
+    {
+        // the view pixel format is not compatible with the base texture (Metal's view rules are
+        // stricter than Vulkan's VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT, which allows e.g.
+        // RGBA32Uint <-> BC3 reinterprets). Fall back to a view with the base texture's own
+        // pixel format so the sampling keeps working (components will differ from the game's
+        // reinterpret) instead of caching and binding a nil texture
+        static std::atomic<uint32> s_viewFallbackLogCount{ 0 };
+        if (s_viewFallbackLogCount.fetch_add(1) < 8)
+            cemuLog_log(LogType::Force, "LatteTextureViewMtl: view format {:04x} not compatible with base texture format {:04x} ({:08x}), falling back to the base format",
+                (uint32)format, (uint32)m_baseTexture->format, baseTexture->physAddress);
+        if (swizzle)
+            view = m_baseTexture->GetTexture()->newTextureView(m_baseTexture->GetTexture()->pixelFormat(), textureType, NS::Range::Make(baseLevel, levelCount), NS::Range::Make(baseLayer, layerCount), *swizzle);
+        else
+            view = m_baseTexture->GetTexture()->newTextureView(m_baseTexture->GetTexture()->pixelFormat(), textureType, NS::Range::Make(baseLevel, levelCount), NS::Range::Make(baseLayer, layerCount));
+    }
+    return view;
 }

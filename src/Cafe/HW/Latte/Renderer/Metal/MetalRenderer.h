@@ -6,6 +6,10 @@
 #include "Cafe/HW/Latte/Renderer/Metal/MetalPerformanceMonitor.h"
 #include "Cafe/HW/Latte/Renderer/Metal/MetalOutputShaderCache.h"
 #include "Cafe/HW/Latte/Renderer/Metal/MetalAttachmentsInfo.h"
+#include "Cafe/HW/Latte/Renderer/Metal/LatteTextureViewMtl.h"
+
+#include <atomic>
+#include <unordered_map>
 
 enum MetalGeneralShaderType
 {
@@ -67,13 +71,22 @@ struct MetalEncoderState
     MTL::Winding m_frontFaceWinding = MTL::WindingClockwise;
     MTL::Viewport m_viewport;
     MTL::ScissorRect m_scissor;
+    // same reasoning as m_blendColor below: a guest scissor of (0,0,0,0) is legal (and streamout
+    // draws carrying one are still issued), so a zeroed state cannot stand in for "not set yet".
+    // Without this the comparison in BindStageResources sees no change on a fresh encoder and never
+    // emits setScissorRect, leaving Metal's default scissor - the whole render target
+    bool m_scissorSet = false;
     uint32 m_stencilRefFront = 0;
     uint32 m_stencilRefBack = 0;
-    uint32 m_blendColor[4] = {0};
+    // sentinel-initialized: a guest blend constant of (0,0,0,0) is legal, so a zeroed state must
+    // not suppress the setBlendColor emission on a fresh encoder (Metal's initial blend constant
+    // is undocumented; Vulkan issues vkCmdSetBlendConstants unconditionally per draw)
+    uint32 m_blendColor[4] = {0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF};
     uint32 m_depthBias = 0;
    	uint32 m_depthSlope = 0;
    	uint32 m_depthClamp = 0;
     bool m_depthClipEnable = true;
+    bool m_visibilityResultCounting = false;
     struct {
         MTL::Buffer* m_buffer;
         size_t m_offset;
@@ -177,6 +190,11 @@ public:
 	void SwapBuffers(bool swapTV, bool swapDRC) override;
 
 	void HandleScreenshotRequest(LatteTextureView* texView, bool padView) override;
+	// The readback half of a screenshot. HandleScreenshotRequest only records what to capture, because
+	// it runs mid-frame with the render pass open, where the blit cannot be committed and waited on;
+	// this encodes the blit into its own command buffer at the end of SwapBuffers, after the frame's
+	// command buffer is committed, and only then reads the result
+	void ProcessPendingScreenshot();
 
 	void DrawBackbufferQuad(LatteTextureView* texView, RendererOutputShader* shader, bool useLinearTexFilter,
 									sint32 imageX, sint32 imageY, sint32 imageWidth, sint32 imageHeight,
@@ -225,6 +243,99 @@ public:
 
 	// surface copy
 	void surfaceCopy_copySurfaceWithFormatConversion(LatteTexture* sourceTexture, sint32 srcMip, sint32 srcSlice, LatteTexture* destinationTexture, sint32 dstMip, sint32 dstSlice, sint32 width, sint32 height) override;
+	void surfaceCopy_viaDrawcall(LatteTexture* sourceTexture, sint32 srcMip, sint32 srcSlice, LatteTexture* destinationTexture, sint32 dstMip, sint32 dstSlice, sint32 effectiveCopyWidth, sint32 effectiveCopyHeight);
+	MTL::RenderPipelineState* surfaceCopy_getOrCreatePipeline(LatteTexture* destinationTexture);
+	// depth-as-data sampling support: keeps a color-format copy (depth in the red channel) of depth
+	// textures so shaders can read them as regular texture2d/texture2d_array (Metal has no
+	// texture2d-compatible view for depth formats and the decompiled MSL never declares depth2d).
+	// Plain 2D and 2D-array depth textures are mirrored (all layers, full mip chain); the bound view
+	// selects the slice range, so array shadow cascades sample the correct layer.
+	// refreshColorCopyBeforeDraw breaks the pass and encodes the copy into the main command buffer;
+	// it is called from PrepareFeedbackLoopShadowCopies before the draw's pass is acquired, which
+	// keeps the copy strictly ordered after the depth writes (a side command buffer would commit
+	// ahead of the uncommitted main command buffer and could read stale depth)
+	bool depthCopy_ensureColorCopy(class LatteTextureView* textureView, MTL::Texture** colorCopyOut, MTL::PixelFormat* mirrorFormatOut);
+	void depthCopy_encodeCopies(MTL::CommandBuffer* commandBuffer, class LatteTextureMtl* texMtl, MTL::Texture* colorCopy, MTL::PixelFormat mirrorFormat);
+	void depthCopy_refreshColorCopyBeforeDraw(class LatteTextureView* textureView);
+	MTL::RenderPipelineState* depthCopy_getOrCreatePipeline(MTL::PixelFormat mirrorFormat);
+
+	// attachment feedback loop workaround: draws sampling a texture that is an attachment of the
+	// active FBO get the attachment contents served from shadow copies (see
+	// PrepareFeedbackLoopShadowCopies). m_feedbackShadowCopies owns the reused shadow textures,
+	// m_feedbackShadowTextures holds the per-draw overrides consumed by BindStageResources (cleared
+	// per draw, non-owning)
+	void PrepareFeedbackLoopShadowCopies(class LatteDecompilerShader* vertexShader, class LatteDecompilerShader* geometryShader, class LatteDecompilerShader* pixelShader);
+	// Is this texture one of the active FBO's color attachments? A draw sampling such a texture is an
+	// attachment feedback loop, whose reads have to be served from a shadow copy
+	bool TextureIsActiveColorAttachment(class LatteTexture* baseTexture) const;
+	// Regenerates never-written upper mip levels of sampled effect buffers from their fresh
+	// render-written mip0 (see EnsureSampledMipContentValid in MetalRenderer.cpp). Runs before
+	// PrepareFeedbackLoopShadowCopies so feedback shadow copies pick up the regenerated levels
+	void EnsureSampledMipContentValid(class LatteDecompilerShader* vertexShader, class LatteDecompilerShader* geometryShader, class LatteDecompilerShader* pixelShader);
+
+	struct FeedbackShadowCopy
+	{
+		MTL::Texture* texture = nullptr;
+		MTL::PixelFormat pixelFormat{};
+		MTL::TextureType textureType{};
+		uint32 width = 0;
+		uint32 height = 0;
+		uint32 mipLevels = 0;
+		uint32 arrayLength = 0;
+		// owned cached sample views of the shadow texture - see GetFeedbackShadowSampleView.
+		// Owned by this struct: released on destruction and whenever the shadow texture is replaced
+		std::unordered_map<LatteMtlSampleViewKey, MTL::Texture*> sampleViews;
+
+		~FeedbackShadowCopy() { releaseSampleViews(); }
+
+		// non-copyable: members own ObjC references, a copy would double-release
+		FeedbackShadowCopy() = default;
+		FeedbackShadowCopy(const FeedbackShadowCopy&) = delete;
+		FeedbackShadowCopy& operator=(const FeedbackShadowCopy&) = delete;
+		FeedbackShadowCopy(FeedbackShadowCopy&& other) noexcept
+		{
+			texture = other.texture;
+			other.texture = nullptr;
+			pixelFormat = other.pixelFormat;
+			textureType = other.textureType;
+			width = other.width;
+			height = other.height;
+			mipLevels = other.mipLevels;
+			arrayLength = other.arrayLength;
+			sampleViews = std::move(other.sampleViews);
+		}
+		FeedbackShadowCopy& operator=(FeedbackShadowCopy&& other) noexcept
+		{
+			if (this != &other)
+			{
+				releaseSampleViews();
+				texture = other.texture;
+				other.texture = nullptr;
+				pixelFormat = other.pixelFormat;
+				textureType = other.textureType;
+				width = other.width;
+				height = other.height;
+				mipLevels = other.mipLevels;
+				arrayLength = other.arrayLength;
+				sampleViews = std::move(other.sampleViews);
+			}
+			return *this;
+		}
+
+		void releaseSampleViews()
+		{
+			for (auto& [key, view] : sampleViews)
+				view->release();
+			sampleViews.clear();
+		}
+	};
+	std::unordered_map<LatteTexture*, FeedbackShadowCopy> m_feedbackShadowCopies;
+	std::unordered_map<LatteTexture*, MTL::Texture*> m_feedbackShadowTextures;
+
+	MTL::Texture* CreateFeedbackShadowView(MTL::Texture* shadow, class LatteTextureView* textureView, const MTL::TextureSwizzleChannels& swizzle);
+	// Cached variant: one driver allocation per distinct view spec instead of per draw. The
+	// cache lives on the shadow entry and is invalidated when the shadow texture is replaced
+	MTL::Texture* GetFeedbackShadowSampleView(FeedbackShadowCopy& shadowCopy, class LatteTextureView* textureView, uint32 gpuSamplerSwizzle);
 
 	// buffer cache
 	void bufferCache_init(const sint32 bufferSize) override;
@@ -265,18 +376,11 @@ public:
 	void occlusionQuery_updateState() override;
 
 	// Helpers
-	MetalPerformanceMonitor& GetPerformanceMonitor() { return m_performanceMonitor; }
-
 	void SetShouldMaximizeConcurrentCompilation(bool shouldMaximizeConcurrentCompilation)
 	{
 	    if (m_supportsMetal3)
 	        m_device->setShouldMaximizeConcurrentCompilation(shouldMaximizeConcurrentCompilation);
 	}
-
-	bool IsCommandBufferActive() const
-	{
-        return (m_currentCommandBuffer.m_commandBuffer && !m_currentCommandBuffer.m_commited);
-    }
 
 	MTL::CommandBuffer* GetCurrentCommandBuffer() const
     {
@@ -297,16 +401,6 @@ public:
     void RequestSoonCommit()
     {
         m_commitTreshold = m_recordedDrawcalls + 8;
-    }
-
-    MTL::CommandEncoder* GetCommandEncoder()
-    {
-        return m_commandEncoder;
-    }
-
-    MetalEncoderType GetEncoderType()
-    {
-        return m_encoderType;
     }
 
     void ResetEncoderState()
@@ -347,6 +441,9 @@ public:
     bool AcquireDrawable(bool mainWindow);
 
     //bool CheckIfRenderPassNeedsFlush(LatteDecompilerShader* shader);
+    // Samples pack-resized effect surfaces: the game's samplers force LODs into mip levels that no
+    // render pass ever writes, so a unit whose chain content cannot be trusted
+    // (LatteTextureMtl::RangeContentIsTrustworthy) is served from a single-level view
     void BindStageResources(MTL::RenderCommandEncoder* renderCommandEncoder, LatteDecompilerShader* shader, bool usesGeometryShader);
 
     void ClearColorTextureInternal(MTL::Texture* mtlTexture, sint32 sliceIndex, sint32 mipIndex, float r, float g, float b, float a);
@@ -367,6 +464,13 @@ public:
     bool SupportsFramebufferFetch() const
     {
         return m_supportsFramebufferFetch;
+    }
+
+    // a GPU-capture/frame-debugger session is active (Xcode sets METAL_CAPTURE_ENABLED) -
+    // async-compiled draws are disabled in that case (Vulkan parity: IsTracingToolEnabled)
+    bool IsTracingToolEnabled() const
+    {
+        return m_usingTracingTool;
     }
 
     bool HasUnifiedMemory() const
@@ -458,11 +562,8 @@ public:
         m_occlusionQuery.m_lastCommandBuffer = GetAndRetainCurrentCommandBufferIfNotCompleted();
     }
 
-    // GPU capture
-    void CaptureFrame()
-    {
-        m_captureFrame = true;
-    }
+    // GPU capture. Defined out of line (called from the GUI thread, consumed in SwapBuffers)
+    void CaptureFrame();
 
 private:
 	MetalLayerHandle m_mainLayer;
@@ -483,6 +584,7 @@ private:
 	bool m_hasUnifiedMemory;
 	bool m_supportsMetal3;
 	bool m_supportsMeshShaders;
+	bool m_usingTracingTool{ false };
 	uint32 m_recommendedMaxVRAMUsage;
 	MetalPixelFormatSupport m_pixelFormatSupport;
 
@@ -495,7 +597,11 @@ private:
 
 	// Pipelines
 	MTL::RenderPipelineDescriptor* m_copyDepthToColorDesc;
-	std::map<MTL::PixelFormat, MTL::RenderPipelineState*> m_copyDepthToColorPipelines;
+	MTL::RenderPipelineDescriptor* m_copyColorToDepthDesc;
+	std::map<std::pair<MTL::PixelFormat, bool>, MTL::RenderPipelineState*> m_copySurfacePipelines;
+	MTL::DepthStencilState* m_copyDepthState = nullptr;
+	MTL::RenderPipelineState* m_depthColorCopyPipeline = nullptr;
+	MTL::PixelFormat m_depthColorCopyPipelineFormat = MTL::PixelFormatInvalid;
 
 	// Void vertex pipelines
 	class MetalVoidVertexPipeline* m_copyBufferToBufferPipeline;
@@ -504,6 +610,13 @@ private:
 	MTL::Event* m_event;
 	int32_t m_eventValue = -1;
 
+	// Per-frame autorelease pool for the render thread. The Latte thread is a plain std::thread
+	// with no AppKit event loop, so without this every autoreleased ObjC object created during a
+	// frame (labels, drawable internals, driver-internal autoreleases inside Metal API calls)
+	// leaks permanently on this thread. Created lazily on first use (GetCommandBuffer), drained
+	// + re-opened at the end of every SwapBuffers, released in the destructor (all same-thread)
+	NS::AutoreleasePool* m_frameAutoreleasePool = nullptr;
+
 	// Resources
 	MTL::SamplerState* m_nearestSampler;
 	MTL::SamplerState* m_linearSampler;
@@ -511,10 +624,34 @@ private:
 	// Null resources
 	MTL::Texture* m_nullTexture1D;
 	MTL::Texture* m_nullTexture2D;
+	MTL::Texture* m_nullTexture2DArray;
 
 	// Texture readback
 	MTL::Buffer* m_readbackBuffer = nullptr;
 	uint32 m_readbackBufferWriteOffset = 0;
+
+	// Screenshot readback (see ProcessPendingScreenshot). The staging allocator cannot be used: its
+	// buffers are reclaimed as soon as the command buffer that used them completes, which is exactly
+	// when this wants to read them, so the destination is renderer-owned and grow-only like the
+	// texture readback buffer above. It is sized per capture rather than to TEXTURE_READBACK_SIZE,
+	// which a 4K 10:10:10:2 frame exceeds
+	struct PendingScreenshot
+	{
+		class LatteTextureMtl* texMtl = nullptr; // alive for the frame it was recorded in
+		uint32 width = 0;
+		uint32 height = 0;
+		MTL::PixelFormat pixelFormat{};
+		bool padView = false;
+	};
+	PendingScreenshot m_pendingScreenshot;
+	bool m_hasPendingScreenshot = false;
+	MTL::Buffer* m_screenshotBuffer = nullptr;
+	uint32 m_screenshotBufferSize = 0;
+	// grow-only private buffer used by texture_copyImageSubData to route raw copies between
+	// aliased textures with compatible-but-different pixel formats (Metal forbids direct blits)
+	MTL::Buffer* m_textureCopyStagingBuffer = nullptr;
+	// dummy binding for the object shader's always-declared indexBuffer on non-indexed mesh draws
+	MTL::Buffer* m_meshIndexDummyBuffer = nullptr;
 
 	// Transform feedback
 	MTL::Buffer* m_xfbRingBuffer = nullptr;

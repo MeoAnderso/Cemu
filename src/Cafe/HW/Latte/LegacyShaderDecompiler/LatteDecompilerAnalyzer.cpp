@@ -12,6 +12,7 @@
 #include "HW/Latte/ISA/LatteReg.h"
 #ifdef ENABLE_METAL
 #include "HW/Latte/Renderer/Metal/MetalCommon.h"
+#include "HW/Latte/Renderer/Metal/MetalRenderer.h"
 #endif
 
 // Defined in LatteTextureLegacy.cpp
@@ -521,10 +522,21 @@ namespace LatteDecompiler
 	void _initTextureBindingPointsMTL(LatteDecompilerShaderContext* decompilerContext)
 	{
 		decompilerContext->output->resourceMappingMTL.textureUnitBaseBindingPoint = decompilerContext->currentTextureBindingPointMTL;
+		// textures that are accessed via a framebuffer fetch read the attachment directly and need
+		// no texture binding. When framebuffer fetch is unavailable the unit is sampled as a regular
+		// texture instead (served from a shadow copy of the attachment by the renderer) and needs a
+		// normal binding - skipping it here left the binding at -1, which the MSL emitter rendered
+		// as [[texture(4294967295)]] and the shader failed to compile.
+		// Note: this runs for every backend on builds where ENABLE_METAL is compiled in, so the
+		// renderer type must be checked before the downcast (dual-backend macOS builds)
+		const bool usesFramebufferFetch = g_renderer->GetType() == RendererAPI::Metal &&
+			static_cast<MetalRenderer*>(g_renderer.get())->SupportsFramebufferFetch();
 		sint32 relBindingPointIndex = 0;
 		for (sint32 i = 0; i < LATTE_NUM_MAX_TEX_UNITS; i++)
 		{
-			if (!decompilerContext->output->textureUnitMask[i] || decompilerContext->shader->textureRenderTargetIndex[i] != 255)
+			if (!decompilerContext->output->textureUnitMask[i])
+				continue;
+			if (usesFramebufferFetch && decompilerContext->shader->textureRenderTargetIndex[i] != 255)
 				continue;
 			decompilerContext->output->resourceMappingMTL.textureUnitToBindingPoint[i] = decompilerContext->currentTextureBindingPointMTL;
 			decompilerContext->output->resourceMappingMTL.relBindingPointToRelTextureUnit[relBindingPointIndex] = i;
@@ -885,75 +897,13 @@ void LatteDecompiler_analyze(LatteDecompilerShaderContext* shaderContext, LatteD
 		shader->textureRenderTargetIndex[i] = 255;
 	}
 	// check if textures are used as render targets
+	// (classification lives in LatteShader_CalcPSRenderTargetIndices so the Metal aux hash can
+	// re-evaluate it against the current register state on shader-state-cache hits)
 	if (shader->shaderType == LatteConst::ShaderType::Pixel)
 	{
-		struct {
-		    sint32 index;
-		    MPTR physAddr;
-			Latte::E_GX2SURFFMT format;
-			Latte::E_HWTILEMODE tileMode;
-		} colorBuffers[LATTE_NUM_COLOR_TARGET]{};
-
-        uint8 colorBufferMask = LatteMRT::GetActiveColorBufferMask(shader, *shaderContext->contextRegistersNew);
-        sint32 colorBufferCount = 0;
-		for (sint32 i = 0; i < LATTE_NUM_COLOR_TARGET; i++)
-        {
-            auto& colorBuffer = colorBuffers[colorBufferCount];
-            if (((colorBufferMask) & (1 << i)) == 0)
-                continue; // color buffer not enabled
-
-            uint32* colorBufferRegBase = shaderContext->contextRegisters + (mmCB_COLOR0_BASE + i);
-           	uint32 regColorBufferBase = colorBufferRegBase[mmCB_COLOR0_BASE - mmCB_COLOR0_BASE] & 0xFFFFFF00; // the low 8 bits are ignored? How to Survive seems to rely on this
-
-            uint32 regColorInfo = colorBufferRegBase[mmCB_COLOR0_INFO - mmCB_COLOR0_BASE];
-
-           	MPTR colorBufferPhysMem = regColorBufferBase;
-            Latte::E_HWTILEMODE colorBufferTileMode = (Latte::E_HWTILEMODE)((regColorInfo >> 8) & 0xF);
-
-            Latte::E_GX2SURFFMT colorBufferFormat = LatteMRT::GetColorBufferFormat(i, *shaderContext->contextRegistersNew);
-
-            colorBuffer = {i, colorBufferPhysMem, colorBufferFormat, colorBufferTileMode};
-            colorBufferCount++;
-        }
-
-	    for (sint32 i = 0; i < shader->textureUnitListCount; i++)
-        {
-            sint32 textureIndex = shader->textureUnitList[i];
-      		const auto& texRegister = texRegs[textureIndex];
-
-      		// get physical address of texture data
-      		MPTR physAddr = (texRegister.word2.get_BASE_ADDRESS() << 8);
-      		if (physAddr == MPTR_NULL)
-                continue; // invalid data
-
-            auto tileMode = texRegister.word0.get_TILE_MODE();
-
-            // Check for dimension
-            auto dim = shader->textureUnitDim[textureIndex];
-            // TODO: 2D arrays could be supported as well
-            if (dim != Latte::E_DIM::DIM_2D)
-                continue;
-
-            // Check for mip level
-            auto lastMip = texRegister.word5.get_LAST_LEVEL();
-            // TODO: multiple mip levels could be supported as well
-            if (lastMip != 0)
-                continue;
-
-            Latte::E_GX2SURFFMT format = LatteTexture_ReconstructGX2Format(texRegister.word1, texRegister.word4);
-
-            // Check if the texture is used as render target
-            for (sint32 j = 0; j < colorBufferCount; j++)
-            {
-                const auto& colorBuffer = colorBuffers[j];
-
-                if (physAddr == colorBuffer.physAddr && format == colorBuffer.format && tileMode == colorBuffer.tileMode)
-                {
-                    shader->textureRenderTargetIndex[textureIndex] = colorBuffer.index;
-                    break;
-                }
-            }
-        }
+		// baseHash comes from the decompiler context: the shader struct's baseHash is not yet
+		// assigned while the analyzer runs
+		LatteShader_CalcPSRenderTargetIndices(shader, shaderContext->shaderBaseHash, shaderContext->contextRegisters, texRegs, *shaderContext->contextRegistersNew, shader->textureRenderTargetIndex);
 	}
 	// for geometry shaders check the copy shader for stream writes
 	if (shader->shaderType == LatteConst::ShaderType::Geometry && shaderContext->parsedGSCopyShader->list_streamWrites.empty() == false)
