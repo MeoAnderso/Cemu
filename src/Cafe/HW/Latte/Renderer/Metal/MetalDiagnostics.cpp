@@ -49,6 +49,8 @@ namespace
 		{ "shader declares more textures/samplers than Metal allows per stage",
 		  "the decompiled shader cannot compile on Metal - draws using it are missing unless a graphic pack replaces it" },
 
+		{ "texture readback of an unsupported shape (a 3D texture, or a mip the texture lacks)",
+		  "the game reads back stale or wrong pixels for this texture" },
 		{ "depth-as-data reads served without a depth mirror",
 		  "effects reading depth may be wrong or blank" },
 		{ "feedback loop unsupported for this attachment",

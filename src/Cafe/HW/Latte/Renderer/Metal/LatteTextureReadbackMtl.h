@@ -6,7 +6,11 @@
 class LatteTextureReadbackInfoMtl : public LatteTextureReadbackInfo
 {
 public:
-	LatteTextureReadbackInfoMtl(class MetalRenderer* mtlRenderer, LatteTextureView* textureView, uint32 bufferOffset) : LatteTextureReadbackInfo(textureView), m_mtlr{mtlRenderer}, m_bufferOffset{bufferOffset} {}
+	// m_firstMip is the mip level the backend transfers, and the consumer writes the result back at
+	// that same level - so it has to come from the view, not default to 0. Vulkan passes it the same
+	// way (TextureReadbackVk.cpp); Metal used to default it, which told the consumer every readback
+	// was mip 0 no matter which mip the view asked for
+	LatteTextureReadbackInfoMtl(class MetalRenderer* mtlRenderer, LatteTextureView* textureView, uint32 bufferOffset) : LatteTextureReadbackInfo(textureView, textureView->firstMip), m_mtlr{mtlRenderer}, m_bufferOffset{bufferOffset} {}
 	~LatteTextureReadbackInfoMtl();
 
 	void StartTransfer() override;

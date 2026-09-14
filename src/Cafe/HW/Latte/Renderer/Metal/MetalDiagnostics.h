@@ -52,6 +52,11 @@ enum class MetalDiagEvent : uint8
 	// declaration, the pipeline fails, and the draws using it are skipped.
 	SamplerBindingOverflow,          // shader declares more textures/samplers than Metal allows
 
+	// Texture and surface handling
+	// The readback blit can only serve a 2D slice of a level the resource actually has, so a
+	// request outside that is served as the nearest expressible one. Reported because the failure
+	// mode is stale or wrong pixels the game goes on to use - a compiled-out assert used to hide it
+	ReadbackShapeUnsupported,        // readback of a 3D texture, or of a mip the texture lacks
 	DepthMirrorUnavailable,          // depth-as-data read has no mirror on this backend
 	FeedbackLoopUnsupported,         // texture sampled while attached, no shadow copy possible
 	// The next three are Metal's handling of sampled mip chains. The first two are the backend's
