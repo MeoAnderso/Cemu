@@ -4294,10 +4294,7 @@ void LatteDecompiler_emitMSLShader(LatteDecompilerShaderContext* shaderContext, 
 	{
 	    if (shader->shaderType == LatteConst::ShaderType::Vertex)
 		{
-            // A rect vertex shader uses the ObjectPayload emitted by _emitVSOutputs, which carries
-            // only vertexOut - writing primitiveId there does not compile, and the rect emulation
-            // geometry shader generates its vertices without needing the input-primitive index
-            if (usesGeometryShader && !isRectVertexShader)
+            if (usesGeometryShader)
             {
            	    // Calculate the imaginary vertex id
                 LattePrimitiveMode vsOutPrimType = shaderContext->contextRegistersNew->VGT_PRIMITIVE_TYPE.get_PRIMITIVE_MODE();
@@ -4315,9 +4312,19 @@ void LatteDecompiler_emitMSLShader(LatteDecompilerShaderContext* shaderContext, 
           		src->add("object_data VertexOut& out = objectPayload.vertexOut[tid];" _CRLF);
           		// the mesh GS has no input-primitive index of its own (MSL has no gl_PrimitiveIDIn
           		// equivalent for mesh functions) - carry it through the payload. tig is the index of
-          		// the input primitive processed by this object threadgroup
-          		src->add("if (tid == 0)" _CRLF);
-          		src->add("    objectPayload.primitiveId = tig;" _CRLF);
+          		// the input primitive processed by this object threadgroup.
+          		// Only the carry is skipped for a rect vertex shader: its ObjectPayload carries just
+          		// vertexOut (see _emitVSOutputs), so there is no field to write, and its emulation GS
+          		// generates its vertices without needing the index. Guarding the whole prologue on
+          		// !isRectVertexShader instead sent rect shaders into the else branch below, which
+          		// emits the *vertex* stage body - vid/iid/out do not exist in an object function, so
+          		// Metal rejected the function and every rect draw (RECTS: most 2D UI) lost its
+          		// pipeline for the rest of the session
+          		if (!isRectVertexShader)
+          		{
+          		    src->add("if (tid == 0)" _CRLF);
+          		    src->add("    objectPayload.primitiveId = tig;" _CRLF);
+          		}
             }
             else
             {
