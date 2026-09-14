@@ -5,6 +5,7 @@
 #include "Cafe/HW/Latte/Renderer/Vulkan/VulkanTextureReadback.h"
 #include "Cafe/HW/Latte/Renderer/Vulkan/CocoaSurface.h"
 #include "Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.h"
+#include "Cafe/HW/Latte/Renderer/SpirvCompiler.h"
 
 #include "Cafe/HW/Latte/Core/LatteBufferCache.h"
 #include "Cafe/HW/Latte/Core/LattePerformanceMonitor.h"
@@ -29,7 +30,7 @@
 #include "Cafe/HW/Latte/Core/LatteTiming.h" // vsync control
 
 #include <cstdint>
-#include <glslang/Public/ShaderLang.h>
+#include <chrono>
 
 #ifndef VK_API_VERSION_MAJOR
 #define VK_API_VERSION_MAJOR(version) (((uint32_t)(version) >> 22) & 0x7FU)
@@ -494,7 +495,7 @@ static void LinuxBreathOfTheWildWorkaround(VkInstance& instance, const VkInstanc
 
 VulkanRenderer::VulkanRenderer() : Renderer(RendererAPI::Vulkan)
 {
-	glslang::InitializeProcess();
+	SpirvCompiler_EnsureInitialized();
 
 	cemuLog_log(LogType::Force, "------- Init Vulkan graphics backend -------");
 

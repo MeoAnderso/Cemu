@@ -160,6 +160,8 @@ add_library(CemuCafe
   HW/Latte/LegacyShaderDecompiler/LatteDecompilerInstructions.h
   HW/Latte/LegacyShaderDecompiler/LatteDecompilerInternal.h
   HW/Latte/LegacyShaderDecompiler/LatteDecompilerRegisterDataTypeTracker.cpp
+  HW/Latte/Renderer/SpirvCompiler.cpp
+  HW/Latte/Renderer/SpirvCompiler.h
   HW/Latte/Renderer/Renderer.cpp
   HW/Latte/Renderer/Renderer.h
   HW/Latte/Renderer/RendererCore.cpp

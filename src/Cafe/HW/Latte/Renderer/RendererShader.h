@@ -18,13 +18,15 @@ public:
 	virtual bool IsCompiled() = 0;
 	virtual bool WaitForCompiled() = 0;
 
+	// generate a Cemu version and setting dependent id (used as FileCache extraVersion for the
+	// precompiled shader caches)
+	static uint32 GeneratePrecompiledCacheId();
 
 protected:
 	// if isGameShader is true, then baseHash and auxHash are valid
 	RendererShader(ShaderType type, uint64 baseHash, uint64 auxHash, bool isGameShader, bool isGfxPackShader)
 		: m_type(type), m_baseHash(baseHash), m_auxHash(auxHash), m_isGameShader(isGameShader), m_isGfxPackShader(isGfxPackShader) {}
 
-	static uint32 GeneratePrecompiledCacheId();
 	static void GenerateShaderPrecompiledCacheFilename(ShaderType type, uint64 baseHash, uint64 auxHash, uint64& h1, uint64& h2);
 
 protected:
