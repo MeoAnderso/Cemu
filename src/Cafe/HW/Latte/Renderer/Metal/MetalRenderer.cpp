@@ -1152,6 +1152,20 @@ void MetalRenderer::texture_copyImageSubData(LatteTexture* src, sint32 srcMip, s
         effectiveCopyHeight *= multY;
     }
 
+    // A region with zero area is a no-op, but Metal rejects it outright - "sourceSize.width * height *
+    // depth must not be 0" - and under API validation that aborts the emulator rather than failing the
+    // copy. The clamp below only covers regions that exceed the mip, so a degenerate region that fits
+    // inside it reached the blit unguarded. Nothing would be copied either way, so skip it here and say
+    // so once per destination: a sync computed as zero-sized means the caller's region math is wrong,
+    // and dropping it silently would leave the destination holding stale content
+    if (effectiveCopyWidth <= 0 || effectiveCopyHeight <= 0 || srcDepth_ <= 0)
+    {
+        MetalDiag_CountOncePer(MetalDiagEvent::SurfaceCopySkipped, dst->physAddress,
+            "texture_copyImageSubData: zero-area copy region {}x{} depth {} (src {:016x} mip {}, dst {:016x} mip {}) - nothing is synced",
+            effectiveCopyWidth, effectiveCopyHeight, srcDepth_, src->physAddress, srcMip, dst->physAddress, dstMip);
+        return;
+    }
+
     // The block-size adjustment above rescales the extent, but that same extent is also used verbatim
     // as the SOURCE region's size. When the source and destination disagree on block size, the scaled
     // extent can exceed the source mip, so sourceOrigin + sourceSize overruns the texture and Metal
