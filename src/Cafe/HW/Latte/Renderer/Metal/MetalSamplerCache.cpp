@@ -29,9 +29,10 @@ MTL::SamplerBorderColor GetBorderColor(LatteConst::ShaderType shaderType, uint32
 		float a = borderColorReg->alpha.get_channelValue();
 
 		// Metal doesn't support custom border color
-		// Let's find the best match
+		// "White" must test all RGB channels: a tinted border like (1,0,0,1) would otherwise be
+		// classified as white on the strength of R alone
 		bool opaque = (a == 1.0f);
-		bool white = (r == 1.0f);
+		bool white = (r == 1.0f && g == 1.0f && b == 1.0f);
 		if (opaque)
 		{
 		    if (white)
