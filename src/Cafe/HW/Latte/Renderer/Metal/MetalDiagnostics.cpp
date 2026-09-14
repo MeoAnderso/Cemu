@@ -46,6 +46,8 @@ namespace
 		// draw could be reached (a pipeline cache replayed on a device without mesh shaders)
 		{ "geometry shader / RECTS work could not be served (no mesh shader support on this device)",
 		  "every draw needing geometry-shader or RECTS emulation is missing on this GPU" },
+		{ "shader declares more textures/samplers than Metal allows per stage",
+		  "the decompiled shader cannot compile on Metal - draws using it are missing unless a graphic pack replaces it" },
 
 		{ "depth-as-data reads served without a depth mirror",
 		  "effects reading depth may be wrong or blank" },

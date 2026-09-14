@@ -2994,6 +2994,14 @@ void MetalRenderer::SetTexture(MTL::RenderCommandEncoder* renderCommandEncoder, 
 
 void MetalRenderer::SetSamplerState(MTL::RenderCommandEncoder* renderCommandEncoder, MetalShaderType shaderType, MTL::SamplerState* samplerState, uint32 index)
 {
+    // the sampler table is the smaller of Metal's two argument tables, and m_samplers below is
+    // sized to match - an index past it corrupts the neighbouring shader stage's entries
+    if (index >= MAX_MTL_SAMPLERS)
+    {
+        cemuLog_logOnce(LogType::Force, "invalid sampler binding {} (Metal allows {})", index, (uint32)MAX_MTL_SAMPLERS);
+        return;
+    }
+
     auto& boundSamplerState = m_state.m_encoderState.m_samplers[shaderType][index];
     if (samplerState == boundSamplerState)
         return;
@@ -3404,6 +3412,12 @@ void MetalRenderer::BindStageResources(MTL::RenderCommandEncoder* renderCommandE
 		    cemuLog_logOnce(LogType::Force, "invalid texture binding {}", binding);
             continue;
 		}
+
+		// Samplers are bound at the same index as their texture: the emitted [[sampler(n)]] carries
+		// the texture binding n, since Metal requires a unique index per sampler argument and the
+		// bindings are already dense over the units that declare one. It is the smaller sampler
+		// table that constrains this - 16 slots against 31 - which is why SetSamplerState checks
+		// the index rather than trusting it
 
 		auto textureView = m_state.m_textures[hostTextureUnit];
 

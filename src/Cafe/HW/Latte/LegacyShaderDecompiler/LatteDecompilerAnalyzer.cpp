@@ -12,6 +12,7 @@
 #include "HW/Latte/ISA/LatteReg.h"
 #ifdef ENABLE_METAL
 #include "HW/Latte/Renderer/Metal/MetalCommon.h"
+#include "HW/Latte/Renderer/Metal/MetalDiagnostics.h"
 #include "HW/Latte/Renderer/Metal/MetalRenderer.h"
 #endif
 
@@ -546,6 +547,32 @@ namespace LatteDecompiler
 		}
 		if (relBindingPointIndex==0)
 			decompilerContext->output->resourceMappingMTL.textureUnitBaseBindingPoint = -1;
+
+		// Metal's sampler argument table is smaller than its texture table - 16 per stage against 31 -
+		// and every unit that declares a texture here also declares a sampler, so the count that has
+		// to fit is textureUnitCount, not the number of distinct guest samplers. The sampler index is
+		// the texture binding (see _emitTextureDefinitions): those are dense over the declaring units
+		// and therefore unique, which matters because Metal rejects a function in which two sampler
+		// arguments claim the same [[sampler(n)]] index.
+		//
+		// Nothing here remaps or clamps anything - a shader over the limit has no valid encoding, so
+		// the only honest thing to do is report it: Metal rejects the over-range declaration at
+		// compile time, the pipeline fails, and the draw is skipped.
+		// Guarded on the renderer type for the same reason as usesFramebufferFetch above - this block
+		// runs for every backend in a dual-backend build, and on Vulkan a shader may legitimately
+		// declare more than 16 textures, so reporting there would name a limit that does not apply
+		if (g_renderer->GetType() == RendererAPI::Metal &&
+			decompilerContext->output->resourceMappingMTL.textureUnitCount > MAX_MTL_SAMPLERS)
+		{
+			// shaderBaseHash, not shader->baseHash: the shader's own hashes are assigned by
+			// LatteShader_CreateShaderFromDecompilerOutput once the decompiler has returned, so at
+			// this point they are still 0 - reading them named every shader 0000000000000000_... and,
+			// since the latch is keyed on the same value, collapsed the detail line to once a session
+			MetalDiag_CountOncePer(MetalDiagEvent::SamplerBindingOverflow, (uintptr_t)decompilerContext->shaderBaseHash,
+				"shader {:016x} declares {} textures/samplers - Metal's sampler table holds {} per stage, so the decompiled shader has no valid encoding (a graphic pack replacement is translated separately and may still compile)",
+				decompilerContext->shaderBaseHash,
+				(sint32)decompilerContext->output->resourceMappingMTL.textureUnitCount, (uint32)MAX_MTL_SAMPLERS);
+		}
 	}
 #endif
 

@@ -440,9 +440,16 @@ namespace LatteDecompiler
     				cemu_assert_unimplemented();
     			}
 
+    			// The sampler index is the texture binding, and deliberately so: the analyzer assigns
+    			// those densely over the units that declare a texture, so they are unique, and Metal
+    			// rejects a function in which two sampler arguments claim the same [[sampler(n)]]
+    			// index. (Remapping units onto shared slots per sampler *state* - the shape upstream
+    			// #2035 proposed - fails exactly there: it produces duplicate indices and Metal
+    			// refuses to reserve the location.) Textures and samplers are separate argument
+    			// tables, so reusing the number is fine. What is not fine is the sampler table being
+    			// the smaller of the two, 16 against 31: a shader declaring more than 16 is reported
+    			// by _initTextureBindingPointsMTL, and cannot compile
     			uint32 binding = shaderContext->output->resourceMappingMTL.textureUnitToBindingPoint[i];
-    			//uint32 textureBinding = shaderContext->output->resourceMappingMTL.textureUnitToBindingPoint[i] % 31;
-    			//uint32 samplerBinding = textureBinding % 16;
     			src->addFmt(" tex{} [[texture({})]]", i, binding);
     			src->addFmt(", sampler samplr{} [[sampler({})]]", i, binding);
 			}

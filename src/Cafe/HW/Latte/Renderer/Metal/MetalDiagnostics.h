@@ -46,6 +46,12 @@ enum class MetalDiagEvent : uint8
 	// no mesh shader support has no route for these draws at all and they are dropped.
 	GeometryShaderUnsupported,       // geometry shader / RECTS draw skipped - no mesh shader support
 
+	// Binding limits. Metal's sampler table is the smaller of the two argument tables (16 against
+	// 31 textures) and Latte has 18 texture units. A shader declaring more than 16 textures - and
+	// so more than 16 sampler arguments - has no valid encoding: Metal rejects the over-range
+	// declaration, the pipeline fails, and the draws using it are skipped.
+	SamplerBindingOverflow,          // shader declares more textures/samplers than Metal allows
+
 	DepthMirrorUnavailable,          // depth-as-data read has no mirror on this backend
 	FeedbackLoopUnsupported,         // texture sampled while attached, no shadow copy possible
 	// The next three are Metal's handling of sampled mip chains. The first two are the backend's

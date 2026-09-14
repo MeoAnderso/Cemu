@@ -131,6 +131,9 @@ bool MetalShaderTranslator_BuildBindingRemaps(const LatteDecompilerShader* shade
 		// to a regular texture2d. Skipping the remap for these units made every shadow-sampling
 		// pack shader fail with "unmapped resource" instead
 		uint32 mtlBinding = (uint32)(sint32)mtl.textureUnitToBindingPoint[i];
+		// the remapped shader declares [[sampler(n)]] with the same n as its [[texture(n)]] - the
+		// two are separate argument tables, and unique per unit is what Metal requires (see
+		// _emitTextureDefinitions)
 		remaps.emplace_back(MslResourceBindingRemap{ vkSetIndex, (uint32)(sint32)vk.textureUnitToBindingPoint[i], 0, mtlBinding, mtlBinding, true, (sint32)i, shader->textureUsesDepthCompare[i] != 0 });
 	}
 
@@ -446,6 +449,18 @@ static bool TranslateGLSLToMSL(const std::string& glslSource, RendererShader::Sh
 				{
 					MetalDiag_Count(MetalDiagEvent::PackShaderFallbackBinding,
 						"{:016x}_{:016x} resource \"{}\" maps to invalid Metal binding {}", baseHash, auxHash, res.name.c_str(), mslIndex);
+					return false;
+				}
+				// ... and the sampler index separately, because it is checked against a different and
+				// smaller table (16 against 31). Both hold the same value today, so this cannot fire
+				// while that is true - it is here so that a sampler index past Metal's table is
+				// reported as a binding problem here, rather than reaching SPIRV-Cross and coming back
+				// as a generic translation failure that names no limit
+				if (!isBuffer && remap->mslSampler >= MAX_MTL_SAMPLERS)
+				{
+					MetalDiag_Count(MetalDiagEvent::PackShaderFallbackBinding,
+						"{:016x}_{:016x} resource \"{}\" maps to invalid Metal sampler binding {} (the sampler table holds {})",
+						baseHash, auxHash, res.name.c_str(), remap->mslSampler, (uint32)MAX_MTL_SAMPLERS);
 					return false;
 				}
 				// texture units that the draw path serves with a comparison sampler must be declared
