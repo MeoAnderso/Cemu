@@ -27,11 +27,16 @@ MTL::RenderPipelineState* MetalOutputShaderCache::GetPipeline(RendererOutputShad
     renderPipelineDescriptor->colorAttachments()->object(0)->setPixelFormat(usesSRGB ? MTL::PixelFormatBGRA8Unorm_sRGB : MTL::PixelFormatBGRA8Unorm);
 
     NS::Error* error = nullptr;
-    renderPipelineState = m_mtlr->GetDevice()->newRenderPipelineState(renderPipelineDescriptor, &error);
+    MTL::RenderPipelineState* newPipelineState = m_mtlr->GetDevice()->newRenderPipelineState(renderPipelineDescriptor, &error);
     if (error)
     {
         cemuLog_log(LogType::Force, "error creating output render pipeline state: {}", error->localizedDescription()->utf8String());
     }
+    // only cache successful states - a nil result would be served forever and later crash
+    // setRenderPipelineState(nullptr) in DrawBackbufferQuad (transient failures must retry)
+    if (!newPipelineState)
+        return nullptr;
 
+    renderPipelineState = newPipelineState;
     return renderPipelineState;
 }
