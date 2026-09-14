@@ -3,10 +3,11 @@
 #include "Common/precompiled.h"
 #include "Cafe/HW/Latte/Renderer/Metal/MetalRenderer.h"
 #include "Cafe/HW/Latte/Core/LatteShader.h"
+#include "Cafe/HW/Latte/LegacyShaderDecompiler/LatteDecompilerEmitSupportBufferLayout.hpp"
 
 namespace LatteDecompiler
 {
-	static void _emitUniformVariables(LatteDecompilerShaderContext* decompilerContext, bool usesGeometryShader)
+	static void _emitUniformVariables(LatteDecompilerShaderContext* decompilerContext)
 	{
 	    auto src = decompilerContext->shaderSource;
 
@@ -14,117 +15,56 @@ namespace LatteDecompiler
 
 		src->add("struct SupportBuffer {" _CRLF);
 
-		uint32 uniformCurrentOffset = 0;
-		auto shader = decompilerContext->shader;
-		auto shaderType = decompilerContext->shader->shaderType;
-		if (decompilerContext->shader->uniformMode == LATTE_DECOMPILER_UNIFORM_MODE_REMAPPED)
+		// the field layout (offsets, sizes, presence) comes from the shared ComputeSupportBufferLayout
+		// (see LatteDecompilerEmitSupportBufferLayout.hpp), using the Vulkan ufBlock profile so the
+		// SupportBuffer stays byte-identical to the Vulkan layout that translated graphic pack shaders
+		// are authored against. This emitter only renders the MSL syntax and bare field names
+		const std::vector<SupportBufferFieldLayout> fields = ComputeSupportBufferLayout(decompilerContext, true, uniformOffsets);
+		for (const auto& field : fields)
 		{
-			// uniform registers or buffers are accessed statically with predictable offsets
-			// this allows us to remap the used entries into a more compact array
-			src->addFmt("int4 remapped[{}];" _CRLF, (sint32)shader->list_remappedUniformEntries.size());
-			uniformOffsets.offset_remapped = uniformCurrentOffset;
-			uniformCurrentOffset += 16 * shader->list_remappedUniformEntries.size();
-		}
-		else if (decompilerContext->shader->uniformMode == LATTE_DECOMPILER_UNIFORM_MODE_FULL_CFILE)
-		{
-			uint32 cfileSize = decompilerContext->analyzer.uniformRegisterAccessTracker.DetermineSize(decompilerContext->shaderBaseHash, 256);
-			// full or partial uniform register file has to be present
-			src->addFmt("int4 uniformRegister[{}];" _CRLF, cfileSize);
-			uniformOffsets.offset_uniformRegister = uniformCurrentOffset;
-			uniformOffsets.count_uniformRegister = cfileSize;
-			uniformCurrentOffset += 16 * cfileSize;
-		}
-		// special uniforms
-		bool hasAnyViewportScaleDisabled =
-			!decompilerContext->contextRegistersNew->PA_CL_VTE_CNTL.get_VPORT_X_SCALE_ENA() ||
-			!decompilerContext->contextRegistersNew->PA_CL_VTE_CNTL.get_VPORT_Y_SCALE_ENA() ||
-			!decompilerContext->contextRegistersNew->PA_CL_VTE_CNTL.get_VPORT_Z_SCALE_ENA();
-
-		if (decompilerContext->shaderType == LatteConst::ShaderType::Vertex && hasAnyViewportScaleDisabled)
-		{
-			// aka GX2 special state 0
-			uniformCurrentOffset = (uniformCurrentOffset + 7)&~7;
-			src->add("float2 windowSpaceToClipSpaceTransform;" _CRLF);
-			uniformOffsets.offset_windowSpaceToClipSpaceTransform = uniformCurrentOffset;
-			uniformCurrentOffset += 8;
-		}
-		bool alphaTestEnable = decompilerContext->contextRegistersNew->SX_ALPHA_TEST_CONTROL.get_ALPHA_TEST_ENABLE();
-		if (decompilerContext->shaderType == LatteConst::ShaderType::Pixel && alphaTestEnable)
-		{
-			uniformCurrentOffset = (uniformCurrentOffset + 3)&~3;
-			src->add("float alphaTestRef;" _CRLF);
-			uniformOffsets.offset_alphaTestRef = uniformCurrentOffset;
-			uniformCurrentOffset += 4;
-		}
-		if (decompilerContext->analyzer.outputPointSize && decompilerContext->analyzer.writesPointSize == false)
-		{
-			if ((decompilerContext->shaderType == LatteConst::ShaderType::Vertex && !decompilerContext->options->usesGeometryShader) ||
-				decompilerContext->shaderType == LatteConst::ShaderType::Geometry)
+			switch (field.kind)
 			{
-				uniformCurrentOffset = (uniformCurrentOffset + 3)&~3;
+			case SupportBufferFieldLayout::Kind::RemappedUniforms:
+				// uniform registers or buffers are accessed statically with predictable offsets
+				// this allows us to remap the used entries into a more compact array
+				src->addFmt("int4 remapped[{}];" _CRLF, field.arrayCount);
+				break;
+			case SupportBufferFieldLayout::Kind::UniformRegisterFile:
+				// full or partial uniform register file has to be present
+				src->addFmt("int4 uniformRegister[{}];" _CRLF, field.arrayCount);
+				break;
+			case SupportBufferFieldLayout::Kind::WindowSpaceToClipSpaceTransform:
+				src->add("float2 windowSpaceToClipSpaceTransform;" _CRLF);
+				break;
+			case SupportBufferFieldLayout::Kind::AlphaTestRef:
+				src->add("float alphaTestRef;" _CRLF);
+				break;
+			case SupportBufferFieldLayout::Kind::PointSize:
 				src->add("float pointSize;" _CRLF);
-				uniformOffsets.offset_pointSize = uniformCurrentOffset;
-				uniformCurrentOffset += 4;
-			}
-		}
-		// define fragCoordScale which holds the xy scale for render target resolution vs effective resolution
-		bool compatNeedFragCoordScalePadding = false; // 2026-06-15 - fragCoordScale is only emitted when accessed now. To keep compatible with old shader replacements we insert padding if its not the last element
-		if (shader->shaderType == LatteConst::ShaderType::Pixel)
-		{
-			if (!decompilerContext->analyzer.hasFragCoordAccess)
-			{
-				// omit fragCoordScale
-				compatNeedFragCoordScalePadding = true;
-			}
-			else
-			{
-				uniformCurrentOffset = (uniformCurrentOffset + 7)&~7;
-				src->add("float2 fragCoordScale;" _CRLF);
-				uniformOffsets.offset_fragCoordScale = uniformCurrentOffset;
-				uniformCurrentOffset += 8;
-			}
-		}
-		// provide scale factor for every texture that is accessed via texel coordinates (texelFetch)
-		for (sint32 t = 0; t < LATTE_NUM_MAX_TEX_UNITS; t++)
-		{
-			if (decompilerContext->analyzer.texUnitUsesTexelCoordinates.test(t) == false)
-				continue;
-			if (compatNeedFragCoordScalePadding)
-			{
-				uniformCurrentOffset = (uniformCurrentOffset + 7)&~7;
-				src->add("float2 fragCoordScaleCompatPadding;" _CRLF);
-				uniformCurrentOffset += 8;
-				compatNeedFragCoordScalePadding = false;
-			}
-			uniformCurrentOffset = (uniformCurrentOffset + 7) & ~7;
-			src->addFmt("float2 tex{}Scale;" _CRLF, t);
-			uniformOffsets.offset_texScale[t] = uniformCurrentOffset;
-			uniformCurrentOffset += 8;
-		}
-		// define verticesPerInstance + streamoutBufferBaseX
-		if ((shader->shaderType == LatteConst::ShaderType::Vertex &&
-		    usesGeometryShader) ||
-	        (decompilerContext->analyzer.useSSBOForStreamout &&
-			(shader->shaderType == LatteConst::ShaderType::Vertex && !decompilerContext->options->usesGeometryShader) ||
-			(shader->shaderType == LatteConst::ShaderType::Geometry)))
-		{
-			src->add("int verticesPerInstance;" _CRLF);
-			uniformOffsets.offset_verticesPerInstance = uniformCurrentOffset;
-			uniformCurrentOffset += 4;
-			for (uint32 i = 0; i < LATTE_NUM_STREAMOUT_BUFFER; i++)
-			{
-				if (decompilerContext->output->streamoutBufferWriteMask[i])
-				{
-					src->addFmt("int streamoutBufferBase{};" _CRLF, i);
-					uniformOffsets.offset_streamoutBufferBase[i] = uniformCurrentOffset;
-					uniformCurrentOffset += 4;
-				}
+				break;
+			case SupportBufferFieldLayout::Kind::FragCoordScale:
+				// vec4 with the render target origin in zw, matching the Vulkan ufBlock layout that
+				// translated graphic pack shaders are authored against. LatteMRT::GetCurrentFragCoordScale
+				// also always writes 4 floats, so a float2 here would clobber the next 8 bytes
+				src->add("float4 fragCoordScale;" _CRLF);
+				break;
+			case SupportBufferFieldLayout::Kind::FragCoordScaleCompatPadding:
+				src->add("float4 fragCoordScaleCompatPadding;" _CRLF);
+				break;
+			case SupportBufferFieldLayout::Kind::TexScale:
+				src->addFmt("float2 tex{}Scale;" _CRLF, field.texUnit);
+				break;
+			case SupportBufferFieldLayout::Kind::VerticesPerInstance:
+				// the mesh path gets its vertex count via a dedicated buffer binding instead (see emitInputs)
+				src->add("int verticesPerInstance;" _CRLF);
+				break;
+			case SupportBufferFieldLayout::Kind::StreamoutBufferBase:
+				src->addFmt("int streamoutBufferBase{};" _CRLF, field.streamoutIndex);
+				break;
 			}
 		}
 
 		src->add("};" _CRLF _CRLF);
-
-		uniformOffsets.offset_endOfBlock = uniformCurrentOffset;
 	}
 
 	static void _emitUniformBuffers(LatteDecompilerShaderContext* decompilerContext)
@@ -345,6 +285,7 @@ namespace LatteDecompiler
     			src->add("};" _CRLF _CRLF);
                 src->add("struct ObjectPayload {" _CRLF);
                 src->add("VertexOut vertexOut[VERTICES_PER_VERTEX_PRIMITIVE];" _CRLF);
+                src->add("uint primitiveId;" _CRLF);
                 src->add("};" _CRLF _CRLF);
     		}
     		if (decompilerContext->shaderType == LatteConst::ShaderType::Geometry)
@@ -416,7 +357,7 @@ namespace LatteDecompiler
 		if(dump_shaders_enabled)
 			decompilerContext->shaderSource->add("// start of shader inputs/outputs, predetermined by Cemu. Do not touch" _CRLF);
 		// uniform variables
-		_emitUniformVariables(decompilerContext, usesGeometryShader);
+		_emitUniformVariables(decompilerContext);
 		// uniform buffers
 		_emitUniformBuffers(decompilerContext);
 		// inputs and outputs
@@ -525,6 +466,10 @@ namespace LatteDecompiler
                 src->addFmt(", device uint* indexBuffer [[buffer({})]]", decompilerContext->output->resourceMappingMTL.indexBufferBinding);
                 // TODO: put into the support buffer?
                 src->addFmt(", constant uchar& indexType [[buffer({})]]", decompilerContext->output->resourceMappingMTL.indexTypeBinding);
+                // vertex count as a dedicated binding: the SupportBuffer must stay byte-identical
+                // to the Vulkan ufBlock (see _emitUniformVariables), which does not carry it for
+                // mesh-path vertex shaders
+                src->addFmt(", constant int& verticesPerInstance [[buffer({})]]", decompilerContext->output->resourceMappingMTL.verticesPerInstanceBinding);
 			}
 			else
 			{
