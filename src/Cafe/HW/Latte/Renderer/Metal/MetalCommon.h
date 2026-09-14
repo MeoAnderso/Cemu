@@ -5,6 +5,15 @@
 
 #include "Cafe/HW/Latte/Core/LatteConst.h"
 
+// Comment emitted at the top of every MSL source the decompiler produces, and required by anything
+// that rewrites that source text before compiling it (RendererShaderMtl::GetStrippedVariant).
+// That transformation understands the shape the decompiler emits - the FragmentOut struct, the
+// "FragmentOut out;" local, the return statement - none of which exist in a translated graphic-pack
+// shader (SPIRV-Cross output: main0_out, other declaration syntax). Without this marker the stripper
+// removes members from a struct it does not own and rewrites the return of a function it did not
+// convert to void, producing a source that cannot compile; with it, the stripper refuses instead
+constexpr const char* kMslDecompilerSourceMarker = "// cemu-decompiler-msl";
+
 struct MetalPixelFormatSupport
 {
 	bool m_supportsR8Unorm_sRGB;
@@ -182,6 +191,10 @@ private:
 };
 */
 
+// Number of vertices per input primitive as consumed by the mesh path. LatteIndices_decode
+// rewrites some primitive modes before they reach the mesh shaders (QUADS/QUAD_STRIP become
+// triangle lists, TRIANGLE_FAN becomes a triangle strip, LINE_LOOP becomes a reconnecting line
+// strip) - the counts below describe the rewritten data, not the guest primitive
 inline uint32 GetVerticesPerPrimitive(LattePrimitiveMode primitiveMode)
 {
     switch (primitiveMode)
@@ -191,10 +204,14 @@ inline uint32 GetVerticesPerPrimitive(LattePrimitiveMode primitiveMode)
     case LattePrimitiveMode::LINES:
         return 2;
     case LattePrimitiveMode::LINE_STRIP:
+    case LattePrimitiveMode::LINE_LOOP:
         // Same as line, but requires connection
         return 2;
     case LattePrimitiveMode::TRIANGLES:
-        return 3;
+    case LattePrimitiveMode::TRIANGLE_STRIP:
+    case LattePrimitiveMode::TRIANGLE_FAN:
+    case LattePrimitiveMode::QUADS:
+    case LattePrimitiveMode::QUAD_STRIP:
     case LattePrimitiveMode::RECTS:
         return 3;
     default:
@@ -203,9 +220,13 @@ inline uint32 GetVerticesPerPrimitive(LattePrimitiveMode primitiveMode)
     }
 }
 
+// Strip modes are consumed as connected primitives (one vertex of overlap between consecutive
+// primitives). TRIANGLE_FAN is consumed like a strip because the index decoder rewrites it into
+// a triangle strip
 inline bool PrimitiveRequiresConnection(LattePrimitiveMode primitiveMode)
 {
-    if (primitiveMode == LattePrimitiveMode::LINE_STRIP)
+    if (primitiveMode == LattePrimitiveMode::LINE_STRIP || primitiveMode == LattePrimitiveMode::LINE_LOOP ||
+        primitiveMode == LattePrimitiveMode::TRIANGLE_STRIP || primitiveMode == LattePrimitiveMode::TRIANGLE_FAN)
         return true;
     else
         return false;
