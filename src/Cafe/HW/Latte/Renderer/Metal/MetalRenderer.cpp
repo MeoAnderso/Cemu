@@ -1060,6 +1060,12 @@ void MetalRenderer::texture_clearColorSlice(LatteTexture* hostTexture, sint32 sl
     auto mtlTexture = static_cast<LatteTextureMtl*>(hostTexture)->GetTexture();
 
     ClearColorTextureInternal(mtlTexture, sliceIndex, mipIndex, r, g, b, a);
+
+    // The clear fills the whole level with a value the game chose, so the level holds the game's
+    // own content - the same standing as a render pass. Record it, or the level looks like one
+    // nobody ever wrote and a chain the game clears and then samples through a multi-mip view gets
+    // clamped to mip 0 by the sample-time workaround
+    static_cast<LatteTextureMtl*>(hostTexture)->MarkLevelCleared((uint32)mipIndex);
 }
 
 void MetalRenderer::texture_clearDepthSlice(LatteTexture* hostTexture, uint32 sliceIndex, sint32 mipIndex, bool clearDepth, bool clearStencil, float depthValue, uint32 stencilValue)
@@ -1098,6 +1104,10 @@ void MetalRenderer::texture_clearDepthSlice(LatteTexture* hostTexture, uint32 sl
     GetTemporaryRenderCommandEncoder(renderPassDescriptor);
     EndEncoding();
 
+    // see texture_clearColorSlice: a cleared level is the game's own content and must be recorded
+    // as such, or the sample-time workaround treats the chain as unmanaged
+    static_cast<LatteTextureMtl*>(hostTexture)->MarkLevelCleared((uint32)mipIndex);
+
     // Debug
     m_performanceMonitor.m_clears++;
 }
@@ -1119,27 +1129,8 @@ void MetalRenderer::texture_copyImageSubData(LatteTexture* src, sint32 srcMip, s
     const auto& srcInfo = GetMtlPixelFormatInfo(src->format, src->isDepth);
     const auto& dstInfo = GetMtlPixelFormatInfo(dst->format, dst->isDepth);
 
-    // Copy provenance (see LatteTextureMtl::MarkCopyMipsWritten). Classify the copy by what it does
-    // to the destination level, which is what decides whether that level's content counts as the
-    // game's own: the level fully covered by a same-sized source level (carried over 1:1), fully
-    // covered from a differently sized source (a deliberate resample - how a game builds its own
-    // mip chain by copying a larger level into a smaller one), or only partly covered (a crop
-    // pasted into the level, leaving the rest of it as whatever was there before)
-    sint32 srcLevelWidth = 0, srcLevelHeight = 0, dstLevelWidth = 0, dstLevelHeight = 0;
-    src->GetEffectiveSize(srcLevelWidth, srcLevelHeight, srcMip);
-    dst->GetEffectiveSize(dstLevelWidth, dstLevelHeight, dstMip);
-    const LatteTextureMtl::CopyProvenance copyProvenance = [&]() {
-        using CopyProvenance = LatteTextureMtl::CopyProvenance;
-        if (effectiveDstX != 0 || effectiveDstY != 0)
-            return CopyProvenance::Partial;
-        if (effectiveCopyWidth != dstLevelWidth || effectiveCopyHeight != dstLevelHeight)
-            return CopyProvenance::Partial;
-        if (effectiveSrcX != 0 || effectiveSrcY != 0)
-            return CopyProvenance::Partial;
-        if (effectiveCopyWidth != srcLevelWidth || effectiveCopyHeight != srcLevelHeight)
-            return CopyProvenance::Resampled;
-        return CopyProvenance::Matched;
-    }();
+    // Copy provenance (see LatteTextureMtl::MarkCopyMipsWritten) is classified further down, after
+    // the copy region has been clamped to the mips - see the comment there for why the order matters
     // Source size seems to apply to the destination texture as well, therefore we need to adjust it when block size doesn't match
     Uvec2 srcBlockTexelSize = GetMtlPixelFormatInfo(src->format, src->isDepth).blockTexelSize;
     Uvec2 dstBlockTexelSize = GetMtlPixelFormatInfo(dst->format, dst->isDepth).blockTexelSize;
@@ -1211,6 +1202,51 @@ void MetalRenderer::texture_copyImageSubData(LatteTexture* src, sint32 srcMip, s
             effectiveCopyHeight = clampedH;
         }
     }
+
+    // Copy provenance (see LatteTextureMtl::MarkCopyMipsWritten). Classify the copy by what it does
+    // to the destination level, which decides whether that level's content counts as the game's own:
+    // fully covered from a same-sized source level (carried over 1:1), fully covered from a
+    // differently sized source (a deliberate resample - how a game builds its own mip chain by
+    // copying a larger level into a smaller one), or only partly covered (a crop pasted into the
+    // level, leaving the rest of it as whatever was there before).
+    //
+    // This runs AFTER the clamp above deliberately. Callers pass the copy region in the textures'
+    // base/effective space (LatteTexture_CopySlice scales it to effective size but does not shift it
+    // by the mip), so for any copy into an upper mip the region arrives larger than that mip and the
+    // clamp is what brings it down to the level. Classifying before the clamp compared the
+    // unclamped region against the mip's own size, so a copy that ends up covering the entire
+    // destination level was recorded as Partial - which is not "partly covered", and which marks the
+    // level untrustworthy and arms the sample-time clamp and the mip regeneration against a chain
+    // the game wrote correctly.
+    sint32 srcLevelWidth = 0, srcLevelHeight = 0, dstLevelWidth = 0, dstLevelHeight = 0;
+    src->GetEffectiveSize(srcLevelWidth, srcLevelHeight, srcMip);
+    dst->GetEffectiveSize(dstLevelWidth, dstLevelHeight, dstMip);
+    // The caller's region is always in the textures' effective (resolution-overwrite) space:
+    // LatteTexture_CopySlice runs it through LatteTexture_scaleToEffectiveSize. It does not, however,
+    // shift it by the mip the way GetEffectiveSize does, and the two orderings do not round the same
+    // way when the overwrite ratio is not a power of two (808/264 is not 3), so the region can come
+    // out a row or two short of the level the MTL texture actually has - measured: a 180x99 region
+    // against a 180x101 mip 3. That shortfall is real, but treating it as Partial is not: Partial
+    // means "a crop pasted into the level, leaving the rest as whatever was there before", whereas
+    // this is a whole-level copy whose scaled extent rounds down. Since Partial is the one provenance
+    // the trust rule never accepts, the distinction decides whether a level is trusted at all. The
+    // tolerance is the integer-division bound of the scaling above, not a value chosen to pass a
+    // case; a real crop still shows up as a non-zero offset, which is checked unconditionally
+    const auto coversLevel = [](sint32 w, sint32 h, sint32 levelW, sint32 levelH) {
+        return w <= levelW && h <= levelH && w >= levelW - 1 && h >= levelH - 1;
+    };
+    const LatteTextureMtl::CopyProvenance copyProvenance = [&]() {
+        using CopyProvenance = LatteTextureMtl::CopyProvenance;
+        if (effectiveDstX != 0 || effectiveDstY != 0)
+            return CopyProvenance::Partial;
+        if (!coversLevel(effectiveCopyWidth, effectiveCopyHeight, dstLevelWidth, dstLevelHeight))
+            return CopyProvenance::Partial;
+        if (effectiveSrcX != 0 || effectiveSrcY != 0)
+            return CopyProvenance::Partial;
+        if (!coversLevel(effectiveCopyWidth, effectiveCopyHeight, srcLevelWidth, srcLevelHeight))
+            return CopyProvenance::Resampled;
+        return CopyProvenance::Matched;
+    }();
 
     auto blitCommandEncoder = GetBlitCommandEncoder();
 
@@ -1600,7 +1636,29 @@ void MetalRenderer::surfaceCopy_viaDrawcall(LatteTexture* sourceTexture, sint32 
 	LatteTexture_TrackTextureGPUWrite(destinationTexture, dstSlice, dstMip, LatteTexture_getNextUpdateEventCounter());
 	// track the copied mip as written (same bookkeeping as render passes) - see
 	// texture_copyImageSubData
-	static_cast<LatteTextureMtl*>(destinationTexture)->MarkRenderMipsWritten(dstMip, 1);
+	auto destinationMtl = static_cast<LatteTextureMtl*>(destinationTexture);
+	destinationMtl->MarkRenderMipsWritten(dstMip, 1);
+	// and record what the copy did to that level, the same way texture_copyImageSubData does. The
+	// draw covers the region [0,0,effectiveCopyWidth,effectiveCopyHeight] of the destination level
+	// and reads the source 1:1 from its origin, so the level is a whole-level carry-over only when
+	// that region is the entire destination level. Without this, a level written here counted as
+	// "GPU written" but never as this chain's own content, which armed the sample-time clamp and the
+	// mip regeneration for any chain the game builds out of copies - a depth-to-colour effect buffer
+	// being sampled through a multi-mip view is the common case.
+	{
+		sint32 srcLevelWidth = 0, srcLevelHeight = 0, dstLevelWidth = 0, dstLevelHeight = 0;
+		sourceTexture->GetEffectiveSize(srcLevelWidth, srcLevelHeight, srcMip);
+		destinationTexture->GetEffectiveSize(dstLevelWidth, dstLevelHeight, dstMip);
+		using CopyProvenance = LatteTextureMtl::CopyProvenance;
+		CopyProvenance copyProvenance = CopyProvenance::Partial;
+		if (effectiveCopyWidth == dstLevelWidth && effectiveCopyHeight == dstLevelHeight)
+		{
+			copyProvenance = (effectiveCopyWidth == srcLevelWidth && effectiveCopyHeight == srcLevelHeight)
+				? CopyProvenance::Matched
+				: CopyProvenance::Resampled;
+		}
+		destinationMtl->MarkCopyMipsWritten(dstMip, 1, copyProvenance);
+	}
 }
 
 MTL::RenderPipelineState* MetalRenderer::depthCopy_getOrCreatePipeline(MTL::PixelFormat mirrorFormat)
@@ -1941,8 +1999,20 @@ void MetalRenderer::EnsureSampledMipContentValid(LatteDecompilerShader* vertexSh
 		// excludes CPU-uploaded asset textures, whose valid chains must never be replaced
 		if ((texMtl->GetRenderWrittenMipMask() & 1u) == 0)
 			continue;
-		if (texMtl->RangeContentIsTrustworthy(textureView->firstMip, textureView->numMip))
-			continue;
+		// Only regenerate a chain the game never manages. If any level above mip 0 carries any write
+		// provenance at all - even a partial copy - the game is building this chain itself, and
+		// generateMipmaps would overwrite levels it wrote with a box filter of mip 0. Measured: a
+		// DoF/bloom chain whose levels 0..2 arrive as resampled copies and whose last level is a
+		// partial copy was regenerated on every draw of the session, destroying the game's own
+		// pyramid each frame. The mechanism exists for chains whose upper levels are NEVER written,
+		// which is what this tests; a partially-written level is not that case
+		{
+			const uint32 anyUpperProvenance =
+				(texMtl->GetPassWrittenMipMask() | texMtl->GetMatchedCopyMipMask() |
+				 texMtl->GetResampledCopyMipMask() | texMtl->GetPartialCopyMipMask()) & ~1u;
+			if (anyUpperProvenance != 0)
+				continue;
+		}
 		// generateMipmaps needs a filterable format AND color renderability - Metal implements
 		// it as render passes, and BC/compressed formats are filterable but NOT renderable
 		// (validation aborts the blit). The clamp class in BindStageResources still covers
@@ -3523,7 +3593,21 @@ void MetalRenderer::BindStageResources(MTL::RenderCommandEncoder* renderCommandE
 				// Only the game's own upper mip levels may be served: the backend's regenerated
 				// downsample is no better than clamping to mip 0, because both replace the levels the
 				// game's own passes wrote (serving them loses DoF and bloom)
-				const bool rangeTrustworthy = texMtl->RangeContentIsTrustworthy(textureView->firstMip, textureView->numMip);
+				// Only the levels this unit can actually resolve have to be trustworthy. The guest
+				// sampler's LOD range (MIN_LOD/MAX_LOD, already carried into the Metal sampler as
+				// its lod clamps) bounds which levels any tap in this draw can reach, and LOD is in
+				// view space - relative to the view's base level. Testing the whole declared range
+				// instead refuses a draw that reads only mip 1 because a level it cannot reach is
+				// partly written. Measured on a DoF/bloom chain: draws sampling at lod 1.00..1.00
+				// were clamped to mip 0 for the whole session because mip 3 was a partial copy.
+				// A unit with no sampler keeps the 0.0 defaults and is judged on its base level only
+				const uint32 lodFirstOffset = (uint32)std::max(0.0f, std::floor(unitLodMin));
+				const uint32 lodLastOffset = (uint32)std::max(0.0f, std::ceil(unitLodMax));
+				const uint32 viewEndMip = textureView->firstMip + textureView->numMip;
+				uint32 trustFirstMip = std::min(textureView->firstMip + lodFirstOffset, viewEndMip - 1);
+				uint32 trustNumMip = std::min(lodLastOffset - lodFirstOffset + 1, viewEndMip - trustFirstMip);
+				trustNumMip = std::max(trustNumMip, 1u);
+				const bool rangeTrustworthy = texMtl->RangeContentIsTrustworthy(trustFirstMip, trustNumMip);
 				if (rangeTrustworthy)
 				{
 					// served exactly as the game asked for it. The per-texture latch lives inside
