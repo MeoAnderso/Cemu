@@ -203,7 +203,7 @@ float3 BicubicHermiteTexture(texture2d<float> textureSrc, sampler samplr, float2
 	float2 frac = fract(pixel);
     pixel = floor(pixel) / texelSize.zw - float2(texelSize.xy/2.0);
 
-	float4 doubleSize = texelSize*texelSize;
+	float4 doubleSize = texelSize*2.0;
 
 	float3 C00 = textureSrc.sample(samplr, pixel + float2(-texelSize.x ,-texelSize.y)).rgb;
     float3 C10 = textureSrc.sample(samplr, pixel + float2( 0.0        ,-texelSize.y)).rgb;
