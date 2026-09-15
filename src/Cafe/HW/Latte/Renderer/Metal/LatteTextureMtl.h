@@ -101,9 +101,10 @@ public:
 		if (firstMip >= 32)
 			return;
 		m_passWrittenMipMask |= (numMips >= 32 ? 0xFFFFFFFFu : ((1u << numMips) - 1u) << firstMip);
-		// a render pass supersedes whatever a copy put into these levels, so the copy provenance
-		// of the written levels is dropped here (see MarkCopyMipsWritten)
+		// a render pass supersedes whatever a copy or a clear put into these levels, so their
+		// provenance is dropped here (see MarkCopyMipsWritten / MarkLevelCleared)
 		const uint32 range = MipRangeMask(firstMip, numMips);
+		m_clearedMipMask &= ~range;
 		m_matchedCopyMipMask &= ~range;
 		m_resampledCopyMipMask &= ~range;
 		m_partialCopyMipMask &= ~range;
@@ -144,6 +145,28 @@ public:
 		return m_partialCopyMipMask;
 	}
 
+	// Levels the game filled with a clear. Not a copy, so it has no CopyProvenance: a clear writes
+	// the whole level with a value the game chose, which puts it in the same standing as a render
+	// pass - the level holds what the game wants there. It needs recording because without it a
+	// cleared level looks like one nobody ever wrote, and a chain the game clears and then samples
+	// through a multi-mip view gets clamped to mip 0
+	uint32 GetClearedMipMask() const {
+		return m_clearedMipMask;
+	}
+
+	// Records that a clear wrote level `mip` in full. The last write wins, exactly as for copies: a
+	// clear supersedes any copy provenance for that level, and MarkCopyMipsWritten/MarkPassMipsWritten
+	// supersede a clear. A level is owned by at most one provenance
+	void MarkLevelCleared(uint32 mip) {
+		const uint32 range = MipRangeMask(mip, 1);
+		if (range == 0)
+			return;
+		m_clearedMipMask = (m_clearedMipMask & ~range) | range;
+		m_matchedCopyMipMask &= ~range;
+		m_resampledCopyMipMask &= ~range;
+		m_partialCopyMipMask &= ~range;
+	}
+
 	// Records what the copy that wrote the levels [firstMip, firstMip + numMips) did. Ranges that do
 	// not fit the 32-bit mask are dropped; RangeContentIsTrustworthy treats an unrepresentable
 	// range as untrustworthy, so dropping them cannot make a chain look better than it is
@@ -151,6 +174,7 @@ public:
 		const uint32 range = MipRangeMask(firstMip, numMips);
 		if (range == 0)
 			return;
+		m_clearedMipMask &= ~range;
 		m_matchedCopyMipMask = (m_matchedCopyMipMask & ~range) | (provenance == CopyProvenance::Matched ? range : 0u);
 		m_resampledCopyMipMask = (m_resampledCopyMipMask & ~range) | (provenance == CopyProvenance::Resampled ? range : 0u);
 		m_partialCopyMipMask = (m_partialCopyMipMask & ~range) | (provenance == CopyProvenance::Partial ? range : 0u);
@@ -165,16 +189,23 @@ public:
 	}
 
 	// Whether mip level `mip` holds content this chain's own writes produced: a render pass wrote it,
-	// or a copy carried the whole level over from a source level of the SAME size. Deliberately not
-	// resampled copies: a whole level copied from a differently sized source is either the game
-	// building its own mip chain (legitimate) or a previous, differently scaled incarnation of this
-	// surface being pasted in (what the workarounds exist to reject), and the two are not
-	// distinguishable from the copy alone - so the trust rule does not accept either, and
-	// GetResampledCopyMipMask exists to tell them apart in the log
+	// or a copy wrote the WHOLE level. Partial is the only copy provenance that leaves part of the
+	// level holding whatever was there before, so it is the only one rejected.
+	//
+	// Resampled is accepted. It means a whole level was written from a source level of a different
+	// size, which happens two ways: the game building its own mip chain (a blur pyramid does exactly
+	// this - 512x256 -> 256x128 -> 128x64 - by copying each level down into the next), or a previous,
+	// differently scaled incarnation of the surface being pasted in. The earlier rule rejected both,
+	// on the grounds that they cannot be told apart from the copy alone. That was too strict, and the
+	// strictness is not symmetric: a falsely-trusted level serves the game's content, which is what
+	// Vulkan serves, while a falsely-rejected one arms the sample-time clamp and the regeneration and
+	// hands the draw a different mip than the game asked for. The trust rule is answering "is this
+	// the game's content", and a full-level resample is. GetResampledCopyMipMask is still recorded so
+	// the log can tell the two apart.
 	bool LevelContentIsTrustworthy(uint32 mip) const {
 		if (mip >= 32)
 			return false;
-		return ((m_passWrittenMipMask | m_matchedCopyMipMask) & (1u << mip)) != 0;
+		return ((m_passWrittenMipMask | m_matchedCopyMipMask | m_resampledCopyMipMask | m_clearedMipMask) & (1u << mip)) != 0;
 	}
 
 	// Whether the whole sampled range [firstMip, firstMip + numMips) can be served exactly as the
@@ -259,10 +290,11 @@ private:
 
 	uint32 m_renderWrittenMipMask{ 0 };
 	uint32 m_passWrittenMipMask{ 0 };
-	// copy provenance, see MarkCopyMipsWritten. Mutually exclusive per level
+	// copy provenance, see MarkCopyMipsWritten / MarkLevelCleared. Mutually exclusive per level
 	uint32 m_matchedCopyMipMask{ 0 };
 	uint32 m_resampledCopyMipMask{ 0 };
 	uint32 m_partialCopyMipMask{ 0 };
+	uint32 m_clearedMipMask{ 0 };
 	LastCopyInfo m_lastCopy;
 	uint64 m_mipGenerationEventCounter{ 0 };
 };
