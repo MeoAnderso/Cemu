@@ -554,9 +554,7 @@ static bool TranslateGLSLToMSL(const std::string& glslSource, RendererShader::Sh
 		mslOptions.msl_version = 20200; // MSL 2.2, available on all supported macOS versions
 		mslOptions.enable_point_size_builtin = true; // allow gl_PointSize in vertex shader replacements
 		mslOptions.argument_buffers = false; // the draw path binds resources per-argument
-		// a fragment output narrower than its attachment fails pipeline creation, and the
-		// orphan-output stripper refuses translated sources (RendererShaderMtl::GetStrippedVariant),
-		// so this is the only protection for that case
+		// a fragment output narrower than its attachment fails pipeline creation
 		mslOptions.pad_fragment_output_components = true;
 		// all released Apple Silicon GPUs ignore one of the three partial derivatives when sampling a
 		// cube texture with explicit gradients (SPIRV-Cross documents this); packs that override mip

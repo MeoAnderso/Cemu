@@ -1,8 +1,5 @@
 #pragma once
 
-#include <map>
-#include <mutex>
-
 #include "Cafe/HW/Latte/Renderer/RendererShader.h"
 #include "HW/Latte/Renderer/Metal/CachedFBOMtl.h"
 #include "HW/Latte/Renderer/Metal/MetalRenderer.h"
@@ -31,7 +28,7 @@ public:
     static void Initialize();
 	static void Shutdown();
 
-	// the Metal compile options every MSL compilation uses (shaders, stripped variants, the pack translator's check)
+	// the Metal compile options every MSL compilation uses (shaders and the pack translator's check)
 	static MTL::CompileOptions* NewCompileOptions(class MetalRenderer* mtlr); // +1, caller releases
 
 	RendererShaderMtl(class MetalRenderer* mtlRenderer, ShaderType type, uint64 baseHash, uint64 auxHash, bool isGameShader, bool isGfxPackShader, const std::string& mslCode);
@@ -47,12 +44,6 @@ public:
 	{
 		return m_baseHash;
 	}
-
-	// Combined entry point for output stripping: variant with the color outputs of
-	// removedColorMask (bitmask 0..7) removed and - when removeDepth is set - the depth output
-	// removed. Cached per combination. Returns nullptr when the source cannot be stripped
-	// (e.g. translated graphic-pack MSL) or compilation failed
-	MTL::Function* GetStrippedVariant(uint32 removedColorMask, bool removeDepth);
 
 	bool HasError() const
 	{
@@ -78,11 +69,6 @@ private:
 	StateSemaphore<COMPILATION_STATE> m_compilationState{ COMPILATION_STATE::NONE };
 
 	std::string m_mslCode;
-	// lazily compiled fragment-function variants with stripped color outputs and/or depth
-	// output (see GetStrippedVariant), keyed by the removed-output bitmask (bit 8 signals
-	// depth removal)
-	std::mutex m_variantMutex;
-	std::map<uint32, MTL::Function*> m_strippedFunctionCache;
 
 	bool ShouldCountCompilation() const;
 

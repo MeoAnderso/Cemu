@@ -40,9 +40,7 @@ public:
 
     bool Compile(bool forceCompile, bool isRenderThread, bool showInOverlay);
 
-    // Resolves the fragment function, stripping orphaned color outputs when the active FBO does
-    // not attach all the slots the shader writes (Metal rejects such pipelines; Vulkan ignores
-    // the orphan outputs). See the definition for details
+    // The pixel shader's fragment function, or null when there is none. See the definition
     MTL::Function* ResolveFragmentFunction();
 
 private:

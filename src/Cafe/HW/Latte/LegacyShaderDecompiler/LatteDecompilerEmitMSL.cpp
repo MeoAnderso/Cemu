@@ -4048,9 +4048,6 @@ void LatteDecompiler_emitMSLShader(LatteDecompilerShaderContext* shaderContext, 
 	StringBuf* src = new StringBuf(1024*1024*12); // reserve 12MB for generated source (we resize-to-fit at the end)
 	shaderContext->shaderSource = src;
 
-	// source-text marker, emitted unconditionally before anything else - consumers that rewrite this
-	// source require it (see kMslDecompilerSourceMarker in MetalCommon.h)
-	src->addFmt("{}" _CRLF, kMslDecompilerSourceMarker);
 	// debug info
 	src->addFmt("// shader {:016x}" _CRLF, shaderContext->shaderBaseHash);
 #ifdef CEMU_DEBUG_ASSERT

@@ -68,10 +68,6 @@ enum class MetalDiagEvent : uint8
 	SampledMipChainClamped,          // sampled view clamped to mip 0
 	SampledMipChainRegenerated,      // upper mips regenerated from mip 0 by the backend
 	SampledMipChainTrusted,          // upper mips served as written (no clamp, no regeneration)
-	// A graphic-pack shader (translated, SPIRV-Cross output) has outputs the active pass has no
-	// attachment for, and the stripper cannot rewrite it - so the draw uses the unstripped function,
-	// which Metal may reject at pipeline creation
-	OrphanOutputStripUnsupported,
 	SurfaceCopySkipped,              // a surface copy was requested but could not be performed
 	// The sampler's LOD bias cannot be applied on this backend version: MTLSamplerDescriptor.lodBias
 	// is API_AVAILABLE(macos(26.0)) only, so the bias is baked into the generated MSL by the Latte

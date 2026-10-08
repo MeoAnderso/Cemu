@@ -310,11 +310,9 @@ void MetalPipelineCompiler::InitFromState(const LatteFetchShader* fetchShader, c
     else
         m_geometryShaderMtl = nullptr;
     m_pixelShaderMtl = static_cast<RendererShaderMtl*>(pixelShader->shader);
-    // Kept for ResolveFragmentFunction (orphan-output stripping) and the failure trace below
+    // Kept for the failure trace in Compile. Both are set here rather than in InitFromStateRender,
+    // because the mesh path (geometry shaders, RECTS emulation) never reaches that function
     m_pixelShader = pixelShader;
-    // Both must be set here rather than in InitFromStateRender: the mesh path (geometry shaders,
-    // RECTS emulation) never reaches that function, and ResolveFragmentFunction would otherwise
-    // strip every color output the pixel shader writes
     m_activeAttachmentsInfo = activeAttachmentsInfo;
 
     if (m_usesGeometryShader)
@@ -592,43 +590,16 @@ bool MetalPipelineCompiler::Compile(bool forceCompile, bool isRenderThread, bool
 	return true;
 }
 
-// Resolves the fragment function for the pipeline, stripping orphaned color outputs when
-// the active FBO does not attach all the slots the shader writes. Metal rejects a pipeline
-// whose fragment function declares [[color(N)]] without a matching attachment (Vulkan
-// silently ignores such outputs), which made depth-only passes with color-writing shaders
-// fail pipeline creation forever and dropped their draws every frame
+// The fragment function for the pipeline. Outputs the active FBO has no attachment for (a depth-only
+// or partial MRT pass) need no special handling: Metal accepts a fragment function that writes
+// [[color(N)]] or [[depth(any)]] without a matching attachment and discards the write, as Vulkan does
 MTL::Function* MetalPipelineCompiler::ResolveFragmentFunction()
 {
-	// m_pixelShaderMtl is dereferenced before m_pixelShader is checked below, and the early
-	// sanity check in Compile() short-circuits past a null m_pixelShaderMtl (it tests
-	// "m_pixelShaderMtl && !GetFunction()"), so a null stage would be dereferenced here
+	// the early sanity check in Compile() short-circuits past a null m_pixelShaderMtl (it tests
+	// "m_pixelShaderMtl && !GetFunction()"), so a null stage must be handled here
 	if (!m_pixelShaderMtl)
 		return nullptr;
-	MTL::Function* fragmentFunction = m_pixelShaderMtl->GetFunction();
-	if (!m_pixelShader)
-		return fragmentFunction;
-	uint32 declaredMask = 0;
-	for (uint8 i = 0; i < LATTE_NUM_COLOR_TARGET; i++)
-	{
-		if (m_activeAttachmentsInfo.colorFormats[i] != Latte::E_GX2SURFFMT::INVALID_FORMAT)
-			declaredMask |= (1u << i);
-	}
-	const uint32 orphanMask = m_pixelShader->pixelColorOutputMask & ~declaredMask;
-	// orphan depth output: the shader writes [[depth(any)]] but the active FBO has no depth
-	// attachment - Metal rejects the pipeline (Vulkan silently ignores orphan depth exports),
-	// which made such passes fail pipeline creation and drop their draws every frame
-	const bool orphanDepth = m_pixelShader->depthMask && m_activeAttachmentsInfo.depthFormat == Latte::E_GX2SURFFMT::INVALID_FORMAT;
-	if (orphanMask == 0 && !orphanDepth)
-		return fragmentFunction;
-	// the combined variant removes both the orphan colors and the depth output in one
-	// surgery - stripping only one would leave the other orphan output declared
-	MTL::Function* stripped = m_pixelShaderMtl->GetStrippedVariant(orphanMask, orphanDepth);
-	if (stripped)
-	{
-		cemuLog_logOnce(LogType::Force, "stripping orphan outputs (colors {:05x} depth {}) from PS {:016x}_{:016x} (depth-only or partial MRT pass)", orphanMask, orphanDepth ? 1 : 0, m_pixelShader->baseHash, m_pixelShader->auxHash);
-		return stripped;
-	}
-	return fragmentFunction;
+	return m_pixelShaderMtl->GetFunction();
 }
 
 void MetalPipelineCompiler::InitFromStateRender(const LatteFetchShader* fetchShader, const LatteDecompilerShader* vertexShader, const MetalAttachmentsInfo& lastUsedAttachmentsInfo, const MetalAttachmentsInfo& activeAttachmentsInfo, const LatteContextRegister& lcr)

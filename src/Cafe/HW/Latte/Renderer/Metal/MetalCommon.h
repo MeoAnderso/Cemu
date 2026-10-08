@@ -5,11 +5,6 @@
 
 #include "Cafe/HW/Latte/Core/LatteConst.h"
 
-// Comment emitted at the top of every MSL source the decompiler produces. Text rewrites
-// (RendererShaderMtl::GetStrippedVariant) require it: they rely on the decompiler's shape (FragmentOut,
-// "FragmentOut out;", the return), which translated pack shaders don't have, so without it they refuse
-constexpr const char* kMslDecompilerSourceMarker = "// cemu-decompiler-msl";
-
 struct MetalPixelFormatSupport
 {
 	bool m_supportsR8Unorm_sRGB;

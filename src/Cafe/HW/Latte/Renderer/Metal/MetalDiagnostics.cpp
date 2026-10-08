@@ -60,8 +60,6 @@ namespace
 		{ "sampled mip chain regenerated from mip 0 by the backend",
 		  "upper mip levels hold backend-generated content on Metal instead of the game's - a filtered effect using this texture can differ from Vulkan" },
 		{ "sampled mip chain served with the game's own upper mip levels", nullptr },
-		{ "graphic pack shader outputs cannot be stripped for this pass (translated shader)",
-		  "this draw uses the untranslated-output function, which the pipeline may reject - the draw is then missing" },
 		{ "surface copies skipped (incompatible dimensions or bytes-per-pixel, or a zero-area region)",
 		  "the copied surface keeps its previous contents" },
 		{ "sampler LOD bias could not be applied",
