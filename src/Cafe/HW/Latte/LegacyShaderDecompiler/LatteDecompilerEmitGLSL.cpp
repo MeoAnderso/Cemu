@@ -997,6 +997,8 @@ void _emitTypeConversionPrefix(LatteDecompilerShaderContext* shaderContext, sint
 		src->add("floatBitsToUint(");
 	else if( sourceType == LATTE_DECOMPILER_DTYPE_SIGNED_INT && destinationType == LATTE_DECOMPILER_DTYPE_FLOAT )
 		src->add("intBitsToFloat(");
+	else if( sourceType == LATTE_DECOMPILER_DTYPE_UNSIGNED_INT && destinationType == LATTE_DECOMPILER_DTYPE_FLOAT )
+		src->add("uintBitsToFloat(");
 	else if( sourceType == LATTE_DECOMPILER_DTYPE_UNSIGNED_INT && destinationType == LATTE_DECOMPILER_DTYPE_SIGNED_INT )
 		src->add("int(");
 	else if( sourceType == LATTE_DECOMPILER_DTYPE_SIGNED_INT && destinationType == LATTE_DECOMPILER_DTYPE_UNSIGNED_INT )
