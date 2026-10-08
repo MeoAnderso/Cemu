@@ -103,6 +103,14 @@ class TextureDecoder
 public:
 	// properties
 	virtual sint32 getBytesPerTexel(LatteTextureLoaderCtx* textureLoader) = 0;
+	// Size of one decoded texel in the CPU staging buffer. getBytesPerTexel takes the loader context,
+	// but no decoder reads it for this query - callers that only need the texel size (e.g. to lay out
+	// an upload) can use this instead of inventing a LatteTextureLoaderCtx
+	sint32 getStagingBytesPerTexel()
+	{
+		return getBytesPerTexel(nullptr);
+	}
+
 	virtual sint32 getTexelCountX(LatteTextureLoaderCtx* textureLoader)
 	{
 		return textureLoader->width;

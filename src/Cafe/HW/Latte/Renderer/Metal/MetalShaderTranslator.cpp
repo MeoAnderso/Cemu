@@ -2,6 +2,8 @@
 #include "Cafe/HW/Latte/LegacyShaderDecompiler/LatteDecompiler.h"
 #include "Cafe/HW/Latte/Renderer/RendererShader.h"
 #include "Cafe/HW/Latte/Renderer/Metal/MetalDiagnostics.h"
+#include "Cafe/HW/Latte/Renderer/Metal/MetalRenderer.h"
+#include "Cafe/HW/Latte/Renderer/Metal/RendererShaderMtl.h"
 #include "Cafe/HW/Latte/Renderer/SpirvCompiler.h"
 #include "Cafe/HW/Latte/Renderer/Metal/MetalCommon.h"
 #include "Cafe/GraphicPack/GraphicPack2.h"
@@ -23,7 +25,8 @@
 // indices of resourceMappingMTL, so the translated shader can be bound by the existing draw path.
 // On any failure the decompiled MSL in strBuf_shaderSource is left in place and used as fallback
 
-static bool TranslateGLSLToMSL(const std::string& glslSource, RendererShader::ShaderType shaderType, const std::vector<MslResourceBindingRemap>& remaps, uint64 baseHash, uint64 auxHash, std::string& mslOut);
+static bool TranslateGLSLToMSL(const std::string& glslSource, RendererShader::ShaderType shaderType, const std::vector<MslResourceBindingRemap>& remaps,
+	const std::vector<MslFetchSkippedUnit>& fetchSkipped, uint64 baseHash, uint64 auxHash, std::string& mslOut);
 
 // Fallback accounting. A failed translation silently falls back to the decompiled shader, which means
 // the pack customization is not applied on Metal - so every reason is counted through the shared
@@ -102,9 +105,11 @@ static const char* GetShaderTypeName(RendererShader::ShaderType type)
 	return "unknown";
 }
 
-bool MetalShaderTranslator_BuildBindingRemaps(const LatteDecompilerShader* shader, const LatteDecompilerShaderResourceMapping& vkMapping, std::vector<MslResourceBindingRemap>& remaps)
+bool MetalShaderTranslator_BuildBindingRemaps(const LatteDecompilerShader* shader, const LatteDecompilerShaderResourceMapping& vkMapping,
+	std::vector<MslResourceBindingRemap>& remaps, std::vector<MslFetchSkippedUnit>& fetchSkipped)
 {
 	remaps.clear();
+	fetchSkipped.clear();
 
 	const auto& vk = vkMapping; // set/binding numbers as declared by the pack GLSL (Vulkan layout)
 	const auto& mtl = shader->resourceMapping; // [[buffer]]/[[texture]] indices used by the Metal draw path (only valid when the active renderer is Metal)
@@ -118,18 +123,17 @@ bool MetalShaderTranslator_BuildBindingRemaps(const LatteDecompilerShader* shade
 			continue; // texture unit not used by the decompiled shader
 		if (mtl.textureUnitToBindingPoint[i] < 0)
 		{
-			// this texture unit is accessed via framebuffer fetch on Metal (it is bound to a render target)
-			MetalDiag_Count(MetalDiagEvent::PackShaderFallbackFramebuffer,
-				"{:016x}_{:016x} uses texture unit {} which is a render target on Metal (framebuffer fetch). Consider authoring this shader in MSL directly (_ps_msl.txt)",
-				shader->baseHash, shader->auxHash, i);
-			return false;
+			// the decompiled shader reads this unit via framebuffer fetch, so the draw path assigns it
+			// no texture binding. Whether the pack shader needs one is decided after it is compiled,
+			// so packs that never mention the unit still translate
+			fetchSkipped.push_back(MslFetchSkippedUnit{ vkSetIndex, (uint32)(sint32)vk.textureUnitToBindingPoint[i], i });
+			continue;
 		}
 		// depth-compare units are supported: the draw path binds the depth view and a comparison
 		// sampler, and SPIRV-Cross emits depth2d + sample_compare when the pack GLSL declares a
 		// shadow sampler (sampler2DShadow). TranslateGLSLToMSL rejects the shader if the SPIR-V
 		// image is not actually declared as depth, since that would bind a comparison sampler
-		// to a regular texture2d. Skipping the remap for these units made every shadow-sampling
-		// pack shader fail with "unmapped resource" instead
+		// to a regular texture2d
 		uint32 mtlBinding = (uint32)(sint32)mtl.textureUnitToBindingPoint[i];
 		// the remapped shader declares [[sampler(n)]] with the same n as its [[texture(n)]] - the
 		// two are separate argument tables, and unique per unit is what Metal requires (see
@@ -265,9 +269,8 @@ void MetalShaderTranslator_PrepareGraphicPackShader(LatteDecompilerShader& shade
 		return;
 	const uint64 baseHash = shader.baseHash;
 	const uint64 auxHash = shader.auxHash;
-	// pack files are named after the upstream (backend-independent) aux hash; the Metal-extended
-	// auxHash only identifies pipeline/shader variants
-	const uint64 packAuxHash = shader.packAuxHash ? shader.packAuxHash : auxHash;
+	// pack shader files are named after the backend-independent aux hash (always assigned; 0 is valid)
+	const uint64 packAuxHash = shader.packAuxHash;
 
 	RendererShader::ShaderType shaderType;
 	GraphicPack2::GP_SHADER_TYPE gpShaderType;
@@ -360,10 +363,11 @@ void MetalShaderTranslator_PrepareGraphicPackShader(LatteDecompilerShader& shade
 
 	std::string translatedMsl;
 	std::vector<MslResourceBindingRemap> remaps;
+	std::vector<MslFetchSkippedUnit> fetchSkipped;
 	try
 	{
-		if (!MetalShaderTranslator_BuildBindingRemaps(&shader, decompilerOutput.resourceMappingVK, remaps) ||
-			!TranslateGLSLToMSL(*packShaderSrc, shaderType, remaps, baseHash, auxHash, translatedMsl))
+		if (!MetalShaderTranslator_BuildBindingRemaps(&shader, decompilerOutput.resourceMappingVK, remaps, fetchSkipped) ||
+			!TranslateGLSLToMSL(*packShaderSrc, shaderType, remaps, fetchSkipped, baseHash, auxHash, translatedMsl))
 			return; // failure already logged, decompiled MSL stays in place
 	}
 	catch (const std::exception& ex)
@@ -394,7 +398,8 @@ void MetalShaderTranslator_PrepareGraphicPackShader(LatteDecompilerShader& shade
 	}
 }
 
-static bool TranslateGLSLToMSL(const std::string& glslSource, RendererShader::ShaderType shaderType, const std::vector<MslResourceBindingRemap>& remaps, uint64 baseHash, uint64 auxHash, std::string& mslOut)
+static bool TranslateGLSLToMSL(const std::string& glslSource, RendererShader::ShaderType shaderType, const std::vector<MslResourceBindingRemap>& remaps,
+	const std::vector<MslFetchSkippedUnit>& fetchSkipped, uint64 baseHash, uint64 auxHash, std::string& mslOut)
 {
 	const char* shaderTypeName = GetShaderTypeName(shaderType);
 
@@ -420,6 +425,21 @@ static bool TranslateGLSLToMSL(const std::string& glslSource, RendererShader::Sh
 			return ReportUnmappedResource(compiler, resources.subpass_inputs[0], baseHash, auxHash, "subpass input");
 		if (!resources.acceleration_structures.empty())
 			return ReportUnmappedResource(compiler, resources.acceleration_structures[0], baseHash, auxHash, "acceleration structure");
+		// storage images are writable: the draw path binds read-only sampled views, so SPIRV-Cross would
+		// emit access::write against a view that cannot accept it. There is no remap class for them, and
+		// looking one up as an image sampler could match a *texture* mapped at the same (set, binding)
+		if (!resources.storage_images.empty())
+			return ReportUnmappedResource(compiler, resources.storage_images[0], baseHash, auxHash, "storage image");
+		// a shader that needs SPIRV-Cross's buffer-size constants would read spvBufferSizeConstants, which
+		// is emitted at a fixed index (Options::buffer_size_buffer_index, 25) that overlaps the range the
+		// draw path binds - reject instead of reading an unrelated binding
+		if (compiler.needs_buffer_size_buffer())
+		{
+			MetalDiag_Count(MetalDiagEvent::PackShaderFallbackResource,
+				"{:016x}_{:016x} needs buffer size constants (SSBO .length()), which cannot be bound on the Metal draw path",
+				baseHash, auxHash);
+			return false;
+		}
 
 		const auto checkResourceList = [&](const spirv_cross::SmallVector<spirv_cross::Resource>& list, const char* category, bool isBuffer) -> bool
 		{
@@ -438,6 +458,18 @@ static bool TranslateGLSLToMSL(const std::string& glslSource, RendererShader::Sh
 						MetalDiag_Count(MetalDiagEvent::PackShaderFallbackResource,
 							"{:016x}_{:016x} declares {} resource \"{}\" at (set {}, binding {}), but the original shader uses this binding for the other resource class. Check the pack shader's binding layout",
 							baseHash, auxHash, category, res.name.c_str(), set, binding);
+						return false;
+					}
+					// the unit exists but the draw path serves it from a render target (framebuffer
+					// fetch), so there is no texture to bind. Only reported for a resource the pack
+					// actually declares - the pack may have renamed or dropped the unit entirely
+					for (const auto& skipped : fetchSkipped)
+					{
+						if (skipped.set != set || skipped.binding != binding)
+							continue;
+						MetalDiag_Count(MetalDiagEvent::PackShaderFallbackFramebuffer,
+							"{:016x}_{:016x} samples texture unit {} as \"{}\", which is a render target on Metal (framebuffer fetch). Consider authoring this shader in MSL directly (_ps_msl.txt)",
+							baseHash, auxHash, skipped.textureUnit, res.name.c_str());
 						return false;
 					}
 					return ReportUnmappedResource(compiler, res, baseHash, auxHash, category);
@@ -463,15 +495,24 @@ static bool TranslateGLSLToMSL(const std::string& glslSource, RendererShader::Sh
 						baseHash, auxHash, res.name.c_str(), remap->mslSampler, (uint32)MAX_MTL_SAMPLERS);
 					return false;
 				}
-				// texture units that the draw path serves with a comparison sampler must be declared
-				// as shadow samplers in the pack GLSL (SPIRV-Cross then emits depth2d + sample_compare);
-				// a regular sampler2d would silently get compare semantics applied to it
-				if (!isBuffer && remap->isDepthCompare)
+				// The declared sampler type must agree with how the draw path serves the unit, in both
+				// directions: the draw path picks the sampler and the view from the *decompiled*
+				// shader's textureUsesDepthCompare, so a mismatch binds a comparison sampler to a
+				// plain view (or the reverse) and Metal rejects the draw instead of the translation
+				if (!isBuffer)
 				{
 					// get_type_from_variable, not get_type: res.id is the OpVariable id, and
 					// get_type expects a type id (it throws Bad cast on a variable)
 					auto& type = compiler.get_type_from_variable(res.id);
-					if (type.image.depth != 1)
+					const bool declaredDepth = (type.image.depth == 1);
+					if (!remap->isDepthCompare && declaredDepth)
+					{
+						MetalDiag_Count(MetalDiagEvent::PackShaderFallbackDepthCompare,
+							"{:016x}_{:016x} declares texture unit {} as a shadow sampler, but the original shader does not sample it with depth compare",
+							baseHash, auxHash, remap->textureUnit);
+						return false;
+					}
+					if (remap->isDepthCompare && !declaredDepth)
 					{
 						MetalDiag_Count(MetalDiagEvent::PackShaderFallbackDepthCompare,
 							"{:016x}_{:016x} samples texture unit {} with depth compare, but the custom shader declares it as a regular sampler (use sampler2DShadow)",
@@ -486,8 +527,7 @@ static bool TranslateGLSLToMSL(const std::string& glslSource, RendererShader::Sh
 			!checkResourceList(resources.separate_images, "texture", false) ||
 			!checkResourceList(resources.separate_samplers, "sampler", false) ||
 			!checkResourceList(resources.uniform_buffers, "uniform buffer", true) ||
-			!checkResourceList(resources.storage_buffers, "storage buffer", true) ||
-			!checkResourceList(resources.storage_images, "storage image", false))
+			!checkResourceList(resources.storage_buffers, "storage buffer", true))
 			return false;
 
 		// make sure no two resources of the same class remap to the same Metal index
@@ -514,6 +554,14 @@ static bool TranslateGLSLToMSL(const std::string& glslSource, RendererShader::Sh
 		mslOptions.msl_version = 20200; // MSL 2.2, available on all supported macOS versions
 		mslOptions.enable_point_size_builtin = true; // allow gl_PointSize in vertex shader replacements
 		mslOptions.argument_buffers = false; // the draw path binds resources per-argument
+		// a fragment output narrower than its attachment fails pipeline creation, and the
+		// orphan-output stripper refuses translated sources (RendererShaderMtl::GetStrippedVariant),
+		// so this is the only protection for that case
+		mslOptions.pad_fragment_output_components = true;
+		// all released Apple Silicon GPUs ignore one of the three partial derivatives when sampling a
+		// cube texture with explicit gradients (SPIRV-Cross documents this); packs that override mip
+		// selection do exactly that, so the fixup is on
+		mslOptions.agx_manual_cube_grad_fixup = true;
 		compiler.set_msl_options(mslOptions);
 		// fixup_clipspace and flip_vert_y stay disabled: SET_POSITION already handles the depth range conversion
 
@@ -544,6 +592,44 @@ static bool TranslateGLSLToMSL(const std::string& glslSource, RendererShader::Sh
 		MetalDiag_Count(MetalDiagEvent::PackShaderFallbackCross,
 			"{:016x}_{:016x} ({}): SPIRV-Cross failed to generate MSL: \"{}\"", baseHash, auxHash, shaderTypeName, e.what());
 		return false;
+	}
+
+	if (mslOut.empty())
+	{
+		// an empty result would replace the decompiled fallback with nothing and compile to no library,
+		// which RendererShaderMtl latches as a permanent failure for the rest of the session
+		MetalDiag_Count(MetalDiagEvent::PackShaderFallbackCross,
+			"{:016x}_{:016x} ({}): SPIRV-Cross returned an empty MSL source", baseHash, auxHash, shaderTypeName);
+		return false;
+	}
+
+	// Compile the result once here, before the caller stores it in the translated-MSL cache: a source
+	// Metal rejects would otherwise be cached and re-served, and the failed library creation would be
+	// latched as a permanent failure (draws using the shader lost for the session and the next one,
+	// until the cache file is deleted by hand). Costs one extra shader compile per pack shader per
+	// cache miss, on the shader-creation thread
+	if (g_renderer && g_renderer->GetType() == RendererAPI::Metal)
+	{
+		auto* mtlRenderer = static_cast<MetalRenderer*>(g_renderer.get());
+		if (mtlRenderer->GetDevice())
+		{
+			// same options the real compilation uses, so a source that only fails under one of them is
+			// still caught here
+			NS_STACK_SCOPED MTL::CompileOptions* options = RendererShaderMtl::NewCompileOptions(mtlRenderer);
+			NS::Error* error = nullptr;
+			MTL::Library* library = mtlRenderer->GetDevice()->newLibrary(ToNSString(mslOut), options, &error);
+			if (library)
+			{
+				library->release();
+			}
+			else
+			{
+				MetalDiag_Count(MetalDiagEvent::PackShaderFallbackCross,
+					"{:016x}_{:016x} ({}): Metal rejected the translated MSL: \"{}\"",
+					baseHash, auxHash, shaderTypeName, error ? error->localizedDescription()->utf8String() : "unknown error");
+				return false;
+			}
+		}
 	}
 
 	cemuLog_logDebug(LogType::Force, "MetalShaderTranslator:translated {:016x}_{:016x} ({}) to MSL", baseHash, auxHash, shaderTypeName);

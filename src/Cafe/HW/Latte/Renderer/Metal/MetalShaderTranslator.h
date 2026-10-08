@@ -20,11 +20,23 @@ struct MslResourceBindingRemap
 	bool isDepthCompare{ false }; // the draw path binds a comparison sampler for this unit
 };
 
+// A texture unit the *decompiled* shader reads via framebuffer fetch, so the Metal draw path assigns it no
+// texture binding. Whether that is actually a problem can only be decided once the pack shader has been
+// compiled - a pack that does not sample the unit is unaffected - so these are recorded and the translation
+// only fails if the pack's SPIR-V really declares one (see TranslateGLSLToMSL)
+struct MslFetchSkippedUnit
+{
+	uint32 set;
+	uint32 binding;
+	sint32 textureUnit;
+};
+
 // Computes the binding remaps for a custom graphic pack shader from the shader's Vulkan resource mapping
 // (the set/binding numbers declared by the pack GLSL) and the Metal resource mapping used by the draw path.
-// Returns false (with a log) if the shader uses features that cannot be translated (e.g. textures that are
-// framebuffer-fetched on Metal)
-bool MetalShaderTranslator_BuildBindingRemaps(const LatteDecompilerShader* shader, const LatteDecompilerShaderResourceMapping& vkMapping, std::vector<MslResourceBindingRemap>& remaps);
+// Returns false (with a diagnostic) only when a buffer resource has no Metal binding. Framebuffer-fetched
+// units are recorded in fetchSkipped instead; they are rejected later, only if the pack's SPIR-V declares them
+bool MetalShaderTranslator_BuildBindingRemaps(const LatteDecompilerShader* shader, const LatteDecompilerShaderResourceMapping& vkMapping,
+	std::vector<MslResourceBindingRemap>& remaps, std::vector<MslFetchSkippedUnit>& fetchSkipped);
 
 // Prepares a graphic pack custom shader for Metal before renderer shader creation. If the pack provides a
 // Vulkan-authored GLSL replacement shader for this shader, it is translated GLSL -> SPIR-V (SpirvCompiler)
@@ -42,8 +54,9 @@ void MetalShaderTranslator_PrepareGraphicPackShader(LatteDecompilerShader& shade
 // texture unit. Used by the render-target classification (LatteShader_CalcPSRenderTargetIndices)
 // to suppress framebuffer-fetch for units a pack shader samples as regular textures - without
 // it the translated pack MSL would have no binding for those units and the translator would
-// reject the pack shader entirely (the cause of the SM3DW AA-pass divergence). Results are
-// cached per base hash; edited graphic packs require a restart (as elsewhere in the pack system)
+// reject the pack shader entirely. It is a text scan of the pack GLSL for textureUnitPS<N>
+// (a heuristic). Results are cached per base hash; edited graphic packs require a restart (as
+// elsewhere in the pack system)
 bool MetalShaderTranslator_PackShaderSamplesTextureUnit(uint64 pixelShaderBaseHash, uint8 textureUnit);
 
 // Flushes and closes the translated-MSL disk cache (opened lazily by PrepareGraphicPackShader).

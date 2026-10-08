@@ -6,7 +6,7 @@
 
 #include <mutex>
 
-std::once_flag s_glslangInitOnce;
+static std::once_flag s_glslangInitOnce;
 
 void SpirvCompiler_EnsureInitialized()
 {
@@ -141,7 +141,7 @@ static EShLanguage GetEShLanguage(RendererShader::ShaderType type)
 	return EShLangVertex;
 }
 
-bool SpirvCompiler_Compile(const std::string& glslSource, RendererShader::ShaderType shaderType, uint64 baseHash, uint64 auxHash, bool debugInfo, std::vector<uint32>& spirvOut)
+bool SpirvCompiler_Compile(const std::string& glslSource, RendererShader::ShaderType shaderType, uint64 baseHash, uint64 auxHash, bool debugInfo, std::vector<uint32>& spirvOut, bool assertOnFailure)
 {
 	SpirvCompiler_EnsureInitialized();
 
@@ -174,6 +174,8 @@ bool SpirvCompiler_Compile(const std::string& glslSource, RendererShader::Shader
 	{
 		cemuLog_log(LogType::Force, fmt::format("GLSL parsing failed for {:016x}_{:016x}: \"{}\"", baseHash, auxHash, Shader.getInfoLog()));
 		cemuLog_logDebug(LogType::Force, "GLSL source:\n{}", glslSource);
+		if (assertOnFailure)
+			cemu_assert_debug(false);
 		return false;
 	}
 
@@ -182,6 +184,8 @@ bool SpirvCompiler_Compile(const std::string& glslSource, RendererShader::Shader
 	if (!Program.link(messages))
 	{
 		cemuLog_log(LogType::Force, fmt::format("GLSL linking failed for {:016x}_{:016x}: \"{}\"", baseHash, auxHash, Program.getInfoLog()));
+		if (assertOnFailure)
+			cemu_assert_debug(false);
 		return false;
 	}
 	if (!Program.mapIO())

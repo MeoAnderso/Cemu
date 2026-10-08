@@ -914,9 +914,9 @@ void _emitTypeConversionPrefixMSL(LatteDecompilerShaderContext* shaderContext, s
 	if( sourceType == destinationType )
 		return;
 	StringBuf* src = shaderContext->shaderSource;
-	// conversion semantics must match the GLSL emitter (_emitTypeConversionPrefix in
-	// LatteDecompilerEmitGLSL.cpp): float<->int are bitcasts, while int<->uint are VALUE
-	// conversions (as_type<int>(uint) would reinterpret the bits instead of converting)
+	// conversion semantics match the GLSL emitter (_emitTypeConversionPrefix in
+	// LatteDecompilerEmitGLSL.cpp): float<->int are bitcasts; int<->uint are value conversions
+	// (the same bits at 32-bit)
 	if (sourceType == LATTE_DECOMPILER_DTYPE_FLOAT && destinationType == LATTE_DECOMPILER_DTYPE_SIGNED_INT)
 	{
 		if (componentCount == 1)
@@ -933,6 +933,14 @@ void _emitTypeConversionPrefixMSL(LatteDecompilerShaderContext* shaderContext, s
 	}
 	else if (sourceType == LATTE_DECOMPILER_DTYPE_SIGNED_INT && destinationType == LATTE_DECOMPILER_DTYPE_FLOAT)
 	{
+		if (componentCount == 1)
+			src->add("as_type<float>(");
+		else
+			src->addFmt("as_type<float{}>(", componentCount);
+	}
+	else if (sourceType == LATTE_DECOMPILER_DTYPE_UNSIGNED_INT && destinationType == LATTE_DECOMPILER_DTYPE_FLOAT)
+	{
+		// bitcast, like the signed case above and uintBitsToFloat in the GLSL emitter
 		if (componentCount == 1)
 			src->add("as_type<float>(");
 		else
@@ -2200,11 +2208,17 @@ static char* _getTexGPRAccess(LatteDecompilerShaderContext* shaderContext, sint3
 }
 
 // Returns the LOD bias of the sampler bound to the given texture unit (0.0 when no sampler is
-// assigned). Metal has no sampler lod-bias property, and its lod clamps also clamp EXPLICIT
-// level() sampling (hardware-verified) - unlike Vulkan's mipLodBias, which never affects
-// explicit-LOD ops. The bias is therefore folded into the emitted LOD expressions here instead
-// of the sampler's clamps. All additions are guarded on bias != 0 so zero-bias samplers (the
-// overwhelming majority) emit byte-identical code
+// assigned). MTLSamplerDescriptor.lodBias exists only from macOS 26 (API_AVAILABLE(macos(26.0)),
+// verified in the SDK header - metal-cpp predates it and does not declare it either) while the
+// deployment target is 13.4, so the sampler cannot carry the bias on the OS versions Cemu ships
+// to. Metal's lod clamps are not an alternative: unlike Vulkan's mipLodBias they also clamp
+// EXPLICIT level() sampling (hardware-verified), which would move explicit-LOD reads to different
+// mips than Vulkan. The bias is therefore folded into the emitted LOD expressions here.
+// All additions are guarded on bias != 0 so zero-bias samplers (the overwhelming majority) emit
+// byte-identical code.
+// Caveat: a shader whose source this emitter did not produce - a graphic pack replacement, or any
+// shader on a unit whose texture carries a pack lod_bias override, which the emitter never sees -
+// cannot carry the bias. MetalDiagEvent::SamplerLodBiasNotApplied reports both cases
 static float _getSamplerLodBiasMSL(LatteDecompilerShaderContext* shaderContext, uint32 textureIndex)
 {
 	auto stageSamplerIndex = shaderContext->shader->textureUnitSamplerAssignment[textureIndex];
@@ -2323,7 +2337,8 @@ static void _emitTEXSampleTextureCode(LatteDecompilerShaderContext* shaderContex
 	if (static_cast<MetalRenderer*>(g_renderer.get())->SupportsFramebufferFetch() && renderTargetIndex != 255)
 	{
 	    // TODO: support comparison samplers
-		// TODO: support swizzling
+		// no swizzle here: a unit whose component select is not the identity is not classified as
+		// a fetch source (see LatteShader_CalcPSRenderTargetIndices), so it never reaches this path
    	    src->addFmt("col{}", renderTargetIndex);
 	}
 	else
@@ -2517,16 +2532,17 @@ static void _emitTEXSampleTextureCode(LatteDecompilerShaderContext* shaderContex
     		}
     		// lod or lod bias parameter
     		// 1D textures don't support lod
-    		if (texDim != Latte::E_DIM::DIM_1D && texDim != Latte::E_DIM::DIM_1D_ARRAY)
+    		// sampleCompareEmulate has no lod_options parameter, so the emulated compare takes none
+    		// either (its helper TODO says as much)
+    		if (texDim != Latte::E_DIM::DIM_1D && texDim != Latte::E_DIM::DIM_1D_ARRAY && !emulateCompare)
     		{
           		if (texOpcode == GPU7_TEX_INST_SAMPLE_L || texOpcode == GPU7_TEX_INST_SAMPLE_LB || texOpcode == GPU7_TEX_INST_SAMPLE_C_L)
           		{
           		    src->add(", ");
          			if (texOpcode == GPU7_TEX_INST_SAMPLE_LB)
          			{
-						// SAMPLE_LB: instruction LOD bias + the sampler's LOD bias (the sampler
-						// bias used to be folded into the sampler clamps, which Metal also
-						// applies to explicit-LOD ops - unlike Vulkan)
+						// SAMPLE_LB: instruction LOD bias + the sampler's LOD bias (baked here, not
+						// into the sampler clamps: Metal applies those to explicit-LOD ops too, unlike Vulkan)
 						if (samplerLodBias != 0.0f)
 							src->addFmt("bias({} + {})", _FormatFloatAsConstant((float)texInstruction->textureFetch.lodBias / 16.0f), _FormatFloatAsConstant(samplerLodBias));
 						else
@@ -2577,7 +2593,9 @@ static void _emitTEXSampleTextureCode(LatteDecompilerShaderContext* shaderContex
     	}
 
     	// offset
-    	if( texOpcode == GPU7_TEX_INST_SAMPLE_L || texOpcode == GPU7_TEX_INST_SAMPLE_LZ || texOpcode == GPU7_TEX_INST_SAMPLE_C_LZ || texOpcode == GPU7_TEX_INST_SAMPLE || texOpcode == GPU7_TEX_INST_SAMPLE_C )
+    	// sampleCompareEmulate takes no offset either, so the emulated compare drops it
+    	if( !emulateCompare &&
+    		(texOpcode == GPU7_TEX_INST_SAMPLE_L || texOpcode == GPU7_TEX_INST_SAMPLE_LZ || texOpcode == GPU7_TEX_INST_SAMPLE_C_LZ || texOpcode == GPU7_TEX_INST_SAMPLE || texOpcode == GPU7_TEX_INST_SAMPLE_C) )
     	{
     		if( hasOffset )
     		{
@@ -2742,11 +2760,8 @@ static void _emitTEXGetTextureResInfoCode(LatteDecompilerShaderContext* shaderCo
 
 	if (static_cast<MetalRenderer*>(g_renderer.get())->SupportsFramebufferFetch() && shaderContext->shader->textureRenderTargetIndex[texInstruction->textureFetch.textureIndex] != 255)
 	{
-	    // the color attachment is declared as texture2d, so its dimensions are queryable directly.
-	    // The fb-fetch classification guarantees a 2D view that matches the sampled view
-	    // (LatteShader_CalcPSRenderTargetIndices), so this returns the same size textureSize()
-	    // would return on the Vulkan path
-	    src->addFmt(" = int4(col{}.get_width(), col{}.get_height(), 1, 1).", (uint32)shaderContext->shader->textureRenderTargetIndex[texInstruction->textureFetch.textureIndex], (uint32)shaderContext->shader->textureRenderTargetIndex[texInstruction->textureFetch.textureIndex]);
+	    // fetch units have no texture to query: sizes come from the fetchTargetSizes binding (BindStageResources)
+	    src->addFmt(" = int4(int(fetchTargetSizes[{}].x), int(fetchTargetSizes[{}].y), 1, 1).", (uint32)shaderContext->shader->textureRenderTargetIndex[texInstruction->textureFetch.textureIndex], (uint32)shaderContext->shader->textureRenderTargetIndex[texInstruction->textureFetch.textureIndex]);
 	}
 	else
 	{
@@ -2869,7 +2884,6 @@ static void _emitTEXSetCubemapIndexCode(LatteDecompilerShaderContext* shaderCont
 
 	// route the source GPR through _getRegisterVarName: with array GPRs active the registers
 	// are Ri[]/Rf[] arrays and a raw R{n}i/R{n}f name would be an undeclared identifier
-	// (same defect class as the RESINFO emission fixed earlier)
 	if (shaderContext->typeTracker.defaultDataType == LATTE_DECOMPILER_DTYPE_SIGNED_INT)
 		src->addFmt(" = as_type<float>({}.{});" _CRLF, _getRegisterVarName(shaderContext, texInstruction->srcGpr), resultElemTable[texInstruction->textureFetch.srcSel[0]]);
 	else if (shaderContext->typeTracker.defaultDataType == LATTE_DECOMPILER_DTYPE_FLOAT)
@@ -3905,8 +3919,7 @@ void LatteDecompiler_emitHelperFunctions(LatteDecompilerShaderContext* shaderCon
 	// TODO: lod_options overload
 	// TODO: when the sampler has linear min mag filter, use gather and filter manually
 	// TODO: offset?
-	// compareFunc uses the E_DEPTH_COMPARE encoding from the sampler registers (the emulated
-	// path previously hardcoded '<', ignoring the configured compare function)
+	// compareFunc uses the E_DEPTH_COMPARE encoding from the sampler registers
 	fCStr_shaderSource->add(""
 	"template<typename TextureT, typename CoordT>\r\n"
 	"float sampleCompareEmulate(TextureT tex, sampler samplr, CoordT coord, float compareValue, uint compareFunc) {\r\n"
@@ -3926,13 +3939,11 @@ void LatteDecompiler_emitHelperFunctions(LatteDecompilerShaderContext* shaderCon
 
 	// Texture calculate lod
 	// TODO: only add when needed
-	// matches GLSL textureQueryLod semantics: .x = raw computed LOD, .y = LOD clamped to the
-	// sampler's LOD range (the previous floor/fract split returned different components
-	// entirely)
+	// GLSL textureQueryLod order: .x = LOD sampling would access (clamped), .y = computed LOD (unclamped)
 	fCStr_shaderSource->add(""
 	"template<typename TextureT, typename CoordT>\r\n"
 	"float2 textureCalculateLod(TextureT tex, sampler samplr, CoordT coord) {\r\n"
-        "return float2(tex.calculate_unclamped_lod(samplr, coord), tex.calculate_clamped_lod(samplr, coord));\r\n"
+        "return float2(tex.calculate_clamped_lod(samplr, coord), tex.calculate_unclamped_lod(samplr, coord));\r\n"
 	"}\r\n");
 
 	// clamp
@@ -4025,15 +4036,6 @@ static void LatteDecompiler_emitAttributeImport(LatteDecompilerShaderContext* sh
 	src->add(");" _CRLF);
 }
 
-#ifdef CEMU_DEBUG_ASSERT
-// Declared in LatteDecompilerEmitGLSLHeader.hpp (compiled in LatteDecompilerEmitGLSL.cpp).
-// Used by the SupportBuffer layout parity oracle in LatteDecompiler_emitMSLShader
-namespace LatteDecompiler
-{
-	void _emitUniformVariables(LatteDecompilerShaderContext* decompilerContext, RendererAPI rendererType, LatteDecompilerOutputUniformOffsets& uniformOffsets);
-}
-#endif
-
 void LatteDecompiler_emitMSLShader(LatteDecompilerShaderContext* shaderContext, LatteDecompilerShader* shader)
 {
     bool isRectVertexShader = UseRectEmulation(*shaderContext->contextRegistersNew);
@@ -4060,57 +4062,6 @@ void LatteDecompiler_emitMSLShader(LatteDecompilerShaderContext* shaderContext, 
     src->add("using namespace metal;" _CRLF);
 	// header part (definitions for inputs and outputs)
 	LatteDecompiler::emitHeader(shaderContext, isRectVertexShader, usesGeometryShader, fetchVertexManually);
-#ifdef CEMU_DEBUG_ASSERT
-	// SupportBuffer layout parity oracle. The MSL SupportBuffer must be byte-identical to the
-	// Vulkan ufBlock. Both header emitters derive their declarations from the shared
-	// ComputeSupportBufferLayout (LatteDecompilerEmitSupportBufferLayout.hpp), so a layout drift
-	// can only happen if one emitter fails to propagate a computed offset (or the emitters stop
-	// using the shared table). Re-run the GLSL emitter into a scratch buffer and compare the
-	// recorded offsets against the ones the MSL emitter produced above.
-	{
-		StringBuf* savedSource = shaderContext->shaderSource;
-		StringBuf* scratchSource = new StringBuf(16 * 1024); // only the uniform block section is emitted here
-		LatteDecompilerOutputUniformOffsets oracleOffsets;
-		shaderContext->shaderSource = scratchSource;
-		LatteDecompiler::_emitUniformVariables(shaderContext, RendererAPI::Vulkan, oracleOffsets);
-		shaderContext->shaderSource = savedSource;
-		delete scratchSource;
-		auto& mslOffsets = shaderContext->output->uniformOffsetsVK;
-		auto checkOffset = [&](sint32 mslValue, sint32 oracleValue, const char* fieldName)
-		{
-			if (mslValue != oracleValue)
-			{
-				cemuLog_log(LogType::Force, "SupportBuffer layout mismatch for shader {:016x}: field {} has MSL offset {} but Vulkan ufBlock offset {}", shaderContext->shaderBaseHash, fieldName, mslValue, oracleValue);
-				cemu_assert_debug(false);
-			}
-		};
-		checkOffset(mslOffsets.offset_remapped, oracleOffsets.offset_remapped, "remapped");
-		checkOffset(mslOffsets.offset_uniformRegister, oracleOffsets.offset_uniformRegister, "uniformRegister");
-		checkOffset(mslOffsets.count_uniformRegister, oracleOffsets.count_uniformRegister, "count_uniformRegister");
-		checkOffset(mslOffsets.offset_alphaTestRef, oracleOffsets.offset_alphaTestRef, "alphaTestRef");
-		checkOffset(mslOffsets.offset_pointSize, oracleOffsets.offset_pointSize, "pointSize");
-		checkOffset(mslOffsets.offset_fragCoordScale, oracleOffsets.offset_fragCoordScale, "fragCoordScale");
-		checkOffset(mslOffsets.offset_windowSpaceToClipSpaceTransform, oracleOffsets.offset_windowSpaceToClipSpaceTransform, "windowSpaceToClipSpaceTransform");
-		for (sint32 i = 0; i < LATTE_NUM_MAX_TEX_UNITS; i++)
-		{
-			if (mslOffsets.offset_texScale[i] != oracleOffsets.offset_texScale[i])
-			{
-				cemuLog_log(LogType::Force, "SupportBuffer layout mismatch for shader {:016x}: field texScale[{}] has MSL offset {} but Vulkan ufBlock offset {}", shaderContext->shaderBaseHash, i, mslOffsets.offset_texScale[i], oracleOffsets.offset_texScale[i]);
-				cemu_assert_debug(false);
-			}
-		}
-		checkOffset(mslOffsets.offset_verticesPerInstance, oracleOffsets.offset_verticesPerInstance, "verticesPerInstance");
-		for (sint32 i = 0; i < LATTE_NUM_STREAMOUT_BUFFER; i++)
-		{
-			if (mslOffsets.offset_streamoutBufferBase[i] != oracleOffsets.offset_streamoutBufferBase[i])
-			{
-				cemuLog_log(LogType::Force, "SupportBuffer layout mismatch for shader {:016x}: field streamoutBufferBase[{}] has MSL offset {} but Vulkan ufBlock offset {}", shaderContext->shaderBaseHash, i, mslOffsets.offset_streamoutBufferBase[i], oracleOffsets.offset_streamoutBufferBase[i]);
-				cemu_assert_debug(false);
-			}
-		}
-		checkOffset(mslOffsets.offset_endOfBlock, oracleOffsets.offset_endOfBlock, "endOfBlock");
-	}
-#endif
 	// helper functions
 	LatteDecompiler_emitHelperFunctions(shaderContext, src);
 	const char* functionType = "";
@@ -4299,9 +4250,24 @@ void LatteDecompiler_emitMSLShader(LatteDecompilerShaderContext* shaderContext, 
            	    // Calculate the imaginary vertex id
                 LattePrimitiveMode vsOutPrimType = shaderContext->contextRegistersNew->VGT_PRIMITIVE_TYPE.get_PRIMITIVE_MODE();
                 if (PrimitiveRequiresConnection(vsOutPrimType))
-           	        src->add("uint vid = tig + tid;" _CRLF);
+                {
+                    // tig counts primitives across all instances; split it so no primitive spans two instances
+                    src->add("uint primsPerInstance = uint(verticesPerInstance) - (VERTICES_PER_VERTEX_PRIMITIVE - 1);" _CRLF);
+                    src->add("uint connectedInstance = tig / primsPerInstance;" _CRLF);
+                    src->add("uint connectedPrim = tig % primsPerInstance;" _CRLF);
+                    if (GetVerticesPerPrimitive(vsOutPrimType) == 3)
+                    {
+                        // a triangle strip in index space (TRIANGLE_STRIP; fans arrive as triangle lists).
+                        // Vulkan strip order, triangle i = (i, i+1+(i&1), i+2-(i&1)):
+                        // odd triangles swap their last two vertices so every triangle keeps the strip's winding
+                        src->add("uint vertexInPrim = (tid == 0u) ? 0u : (((connectedPrim & 1u) != 0u) ? (3u - tid) : tid);" _CRLF);
+                    }
+                    else
+                        src->add("uint vertexInPrim = tid;" _CRLF);
+                    src->add("uint vid = connectedInstance * uint(verticesPerInstance) + connectedPrim + vertexInPrim;" _CRLF);
+                }
                 else
-       	            src->add("uint vid = tig * VERTICES_PER_VERTEX_PRIMITIVE + tid;" _CRLF);
+                    src->add("uint vid = tig * VERTICES_PER_VERTEX_PRIMITIVE + tid;" _CRLF);
           		src->add("uint iid = vid / verticesPerInstance;" _CRLF);
                 src->add("vid %= verticesPerInstance;" _CRLF);
 
@@ -4313,13 +4279,9 @@ void LatteDecompiler_emitMSLShader(LatteDecompilerShaderContext* shaderContext, 
           		// the mesh GS has no input-primitive index of its own (MSL has no gl_PrimitiveIDIn
           		// equivalent for mesh functions) - carry it through the payload. tig is the index of
           		// the input primitive processed by this object threadgroup.
-          		// Only the carry is skipped for a rect vertex shader: its ObjectPayload carries just
-          		// vertexOut (see _emitVSOutputs), so there is no field to write, and its emulation GS
-          		// generates its vertices without needing the index. Guarding the whole prologue on
-          		// !isRectVertexShader instead sent rect shaders into the else branch below, which
-          		// emits the *vertex* stage body - vid/iid/out do not exist in an object function, so
-          		// Metal rejected the function and every rect draw (RECTS: most 2D UI) lost its
-          		// pipeline for the rest of the session
+          		// Only the carry is skipped for a rect vertex shader (not the whole prologue: the else
+          		// branch emits the vertex-stage body): its ObjectPayload carries just vertexOut (see
+          		// _emitVSOutputs), and its emulation GS generates its vertices without the index
           		if (!isRectVertexShader)
           		{
           		    src->add("if (tid == 0)" _CRLF);

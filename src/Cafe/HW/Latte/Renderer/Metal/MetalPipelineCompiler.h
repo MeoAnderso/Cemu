@@ -20,6 +20,10 @@ struct PipelineObject
     // fail identically on every draw, so the cache keeps the entry and skips the draws instead
     // of paying a recompile + log per frame. Driver-side failures stay retryable
     std::atomic_bool permanentFailure{ false };
+    // Retries spent on a driver-side (non-permanent) failure. Render thread only. Without a cap, a
+    // failure that is not a shader-stage error - which the driver rejects identically every time -
+    // recompiles and logs at Force severity once per draw for the rest of the session
+    uint32 transientFailureCount{ 0 };
     // set when the pipeline was queued for asynchronous compilation: persistence is deferred until
     // the compile result is observed on the render thread (AddCurrentStateToCache snapshots the
     // active register/shader state, which the compile thread must not touch). Render thread only
@@ -42,6 +46,12 @@ public:
     MTL::Function* ResolveFragmentFunction();
 
 private:
+    // Creates the pipeline state, probing and then feeding the renderer's MTLBinaryArchive when one
+    // is open. A miss compiles and records the result; a hit skips the compilation entirely. See the
+    // definition for the descriptor-kind and availability details
+    template <typename TDescriptor>
+    MTL::RenderPipelineState* CreatePipelineStateWithArchive(TDescriptor* desc, NS::Error** error);
+
     class MetalRenderer* m_mtlr;
     PipelineObject& m_pipelineObj;
 

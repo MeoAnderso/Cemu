@@ -19,5 +19,8 @@ MetalVoidVertexPipeline::MetalVoidVertexPipeline(class MetalRenderer* mtlRendere
 
 MetalVoidVertexPipeline::~MetalVoidVertexPipeline()
 {
-    m_renderPipelineState->release();
+    // a failed creation leaves this null; callers must treat null as "not usable" (the one call site
+    // is currently commented out, so nothing binds it today)
+    if (m_renderPipelineState)
+        m_renderPipelineState->release();
 }

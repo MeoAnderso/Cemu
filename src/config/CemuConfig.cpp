@@ -146,6 +146,7 @@ XMLConfigParser CemuConfig::Load(XMLConfigParser& parser)
 	vk_accurate_barriers = graphic.get("vkAccurateBarriers", true); // this used to be "VulkanAccurateBarriers" but because we changed the default to true in 1.27.1 the option name had to be changed
 #ifdef ENABLE_METAL
 	force_mesh_shaders = graphic.get("ForceMeshShaders", false);
+	mtl_sampled_mip_workarounds = graphic.get("SampledMipWorkarounds", false);
 #endif
 
 	auto overlay_node = graphic.get("Overlay");
@@ -371,6 +372,7 @@ XMLConfigParser CemuConfig::Save(XMLConfigParser& parser)
 	graphic.set("GX2DrawdoneSync", gx2drawdone_sync);
 #ifdef ENABLE_METAL
 	graphic.set("ForceMeshShaders", force_mesh_shaders);
+	graphic.set("SampledMipWorkarounds", mtl_sampled_mip_workarounds);
 #endif
 	//graphic.set("PrecompiledShaders", precompiled_shaders.GetValue());
 	graphic.set("UpscaleFilter", upscale_filter);

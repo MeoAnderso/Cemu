@@ -31,9 +31,8 @@ template<> struct hash<LatteMtlSampleViewKey>
 	size_t operator()(const LatteMtlSampleViewKey& k) const
 	{
 		// The fields need 79 bits in total (swizzle 12, format 16, dim 3, mips 8+8, slices 16+16),
-		// so no assignment of disjoint bit ranges within a 64-bit value exists. An earlier version
-		// shifted the fields into overlapping ranges and pushed numSlice off the top of size_t.
-		// Fold each field in whole instead. Equality is still decided by the defaulted operator==,
+		// so no assignment of disjoint bit ranges within a 64-bit value exists: fold each field in
+		// whole instead. Equality is still decided by the defaulted operator==,
 		// so this only has to spread the buckets, not be injective
 		size_t h = (size_t)k.swizzle;
 		for (const size_t field : { (size_t)k.format, (size_t)k.dim, (size_t)k.firstMip,

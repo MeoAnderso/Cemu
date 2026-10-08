@@ -126,6 +126,13 @@ MetalRenderer::MetalRenderer() : Renderer(RendererAPI::Metal)
     // initialize glslang for graphic pack shader translation
     SpirvCompiler_EnsureInitialized();
 
+    // the fallback counters are process-global while the summary is logged at title exit: start each
+    // session from zero, or the second game reports the first game's numbers
+    MetalDiag_ResetSession();
+
+    // no GamePad layer exists yet: InitializeLayer(false) clears this when one is created
+    m_padLayerStopRequested.test_and_set();
+
     // frame debuggers / GPU captures don't handle async-compiled (initially skipped) draws well
     // - Xcode's GPU capture sets METAL_CAPTURE_ENABLED in the launched process environment
     m_usingTracingTool = getenv("METAL_CAPTURE_ENABLED") != nullptr;
@@ -407,11 +414,6 @@ MetalRenderer::~MetalRenderer()
     m_nullTexture2D->release();
     m_nullTexture2DArray->release();
 
-    for (auto& [texture, shadowCopy] : m_feedbackShadowCopies)
-    {
-        if (shadowCopy.texture)
-            shadowCopy.texture->release();
-    }
     m_feedbackShadowCopies.clear();
 
     m_nearestSampler->release();
@@ -425,6 +427,8 @@ MetalRenderer::~MetalRenderer()
 
     if (m_meshIndexDummyBuffer)
         m_meshIndexDummyBuffer->release();
+    if (m_emptyBuffer)
+        m_emptyBuffer->release();
 
     if (m_xfbRingBuffer)
         m_xfbRingBuffer->release();
@@ -448,12 +452,21 @@ MetalRenderer::~MetalRenderer()
 void MetalRenderer::InitializeLayer(const Vector2i& size, bool mainWindow)
 {
     auto& layer = GetLayer(mainWindow);
+    // move assignment: MetalLayerHandle owns ObjC references and deletes copies, so the temporary
+    // transfers its references into the member instead of both objects releasing them
     layer = MetalLayerHandle(m_device, size, mainWindow);
-    layer.GetLayer()->setPixelFormat(MTL::PixelFormatBGRA8Unorm);
+    if (layer.GetLayer())
+        layer.GetLayer()->setPixelFormat(MTL::PixelFormatBGRA8Unorm);
+
+    // the new pad layer is fully set up: let the render thread use it (see AcquireDrawable)
+    if (!mainWindow)
+        m_padLayerStopRequested.clear();
 }
 
 void MetalRenderer::ShutdownLayer(bool mainWindow)
 {
+    // move assignment from an empty handle releases the live layer, its view and any outstanding
+    // drawable
     GetLayer(mainWindow) = MetalLayerHandle();
 }
 
@@ -474,11 +487,17 @@ void MetalRenderer::Shutdown()
     ImGui_ImplMetal_Shutdown();
     CommitCommandBuffer();
     Renderer::Shutdown();
+    // LatteThread_Exit frees every shader right after this returns (LatteSHRC_UnloadAll), but the pipeline
+    // cache - and the compile threads that use those shaders - lives until the renderer is deleted
+    m_pipelineCache->StopCompilation();
     RendererShaderMtl::Shutdown();
 }
 
 bool MetalRenderer::IsPadWindowActive()
 {
+    // not race-free (teardown can start right after the test), but this is only a pointer check: every real use is gated in AcquireDrawable
+    if (m_padLayerStopRequested.test())
+        return false;
     return (GetLayer(false).GetLayer() != nullptr);
 }
 
@@ -515,6 +534,10 @@ void MetalRenderer::SwapBuffers(bool swapTV, bool swapDRC)
 
     // Reset the command buffers (they are released by TemporaryBufferAllocator)
     CommitCommandBuffer();
+
+    // the frame's pad work is committed (the command buffer retains what it uses): end the pad frame
+    if (m_padFrameInProgress.load())
+        EndPadFrame();
 
     // A screenshot recorded during this frame is read back here: the frame's command buffer is now
     // committed and nothing is encoding, which is the only point where the blit can be committed and
@@ -594,8 +617,8 @@ void MetalRenderer::ProcessPendingScreenshot()
 	if (!req.texMtl || req.width == 0 || req.height == 0)
 		return;
 
-	const uint32 bytesPerRow = GetMtlTextureBytesPerRow(req.texMtl->format, req.texMtl->isDepth, req.width);
-	const uint32 size = GetMtlTextureBytesPerImage(req.texMtl->format, req.texMtl->isDepth, req.height, bytesPerRow);
+	const uint32 bytesPerRow = (uint32)GetMtlTextureBytesPerRow(req.texMtl->format, req.texMtl->isDepth, req.width);
+	const uint32 size = (uint32)GetMtlTextureBytesPerImage(req.texMtl->format, req.texMtl->isDepth, req.height, bytesPerRow);
 
 	// Renderer-owned destination, grown as needed: the staging allocator reclaims its buffers the
 	// moment the command buffer using them completes, which is precisely when this reads them
@@ -610,7 +633,8 @@ void MetalRenderer::ProcessPendingScreenshot()
 			cemuLog_log(LogType::Force, "screenshot: failed to allocate a {} byte readback buffer", size);
 			return;
 		}
-		m_screenshotBuffer->setLabel(GetLabel("Screenshot readback buffer", m_screenshotBuffer));
+		if (IsTracingToolEnabled())
+			m_screenshotBuffer->setLabel(GetLabel("Screenshot readback buffer", m_screenshotBuffer));
 	}
 
 	// Its own command buffer, committed and waited on here. SwapBuffers has already committed the
@@ -686,7 +710,8 @@ void MetalRenderer::DrawBackbufferQuad(LatteTextureView* texView, RendererOutput
     if (!AcquireDrawable(!padView))
         return;
 
-    MTL::Texture* presentTexture = static_cast<LatteTextureViewMtl*>(texView)->GetRGBAView();
+    // identity RGBA comp-sel, adjusted per format like Vulkan's GetViewRGBA (GetRGBAView is the unswizzled attachment view)
+    MTL::Texture* presentTexture = static_cast<LatteTextureViewMtl*>(texView)->GetSwizzledView(0x06880000);
 
     // Create render pass
     auto& layer = GetLayer(!padView);
@@ -712,8 +737,22 @@ void MetalRenderer::DrawBackbufferQuad(LatteTextureView* texView, RendererOutput
 
     uint8 shaderType = shaderIndex % 3;
 
-    // Get the render pipeline state
-    auto renderPipelineState = m_outputShaderCache->GetPipeline(shader, shaderIndex, m_state.m_usesSRGB);
+    // Get the render pipeline state. The variant (sRGB vs linear) must match the framebuffer this
+    // pass actually renders into, so it is read from the drawable's own texture above rather than
+    // from a flag: the TV and DRC windows can disagree, and an already-acquired drawable keeps the
+    // pixel format the layer had when it was created, so a flag can be out of step with it. Metal
+    // aborts on a mismatch under API validation ("pipeline's pixelFormat ... does not match the
+    // framebuffer's"), which the shared flag produced for the pad window
+    const bool drawableUsesSRGB = layer.GetDrawable()->texture()->pixelFormat() == MTL::PixelFormatBGRA8Unorm_sRGB;
+    auto renderPipelineState = m_outputShaderCache->GetPipeline(shader, shaderIndex, drawableUsesSRGB);
+    if (!renderPipelineState)
+    {
+        // creation failed (already logged) - the cache returns null so the next frame retries.
+        // Setting a nil pipeline state leaves the encoder with whatever was bound before it and
+        // draws with it, so skip the quad instead. End the encoder this function opened
+        EndEncoding();
+        return;
+    }
 
     // Draw to Metal layer
     renderCommandEncoder->setRenderPipelineState(renderPipelineState);
@@ -742,6 +781,29 @@ void MetalRenderer::DrawBackbufferQuad(LatteTextureView* texView, RendererOutput
 bool MetalRenderer::BeginFrame(bool mainWindow)
 {
     return AcquireDrawable(mainWindow);
+}
+
+void MetalRenderer::StopUsingPadAndWait()
+{
+    // Stop the render thread from using the pad layer and wait (bounded) for the pad frame it may be
+    // in to end, so the layer is not destroyed while a drawable from it is still in flight. The
+    // equivalent of VulkanRenderer::StopUsingPadAndWait. Bounded, because the Latte thread may
+    // already be gone (game stopped) - an unbounded wait would hang the GUI thread there
+    m_padLayerStopRequested.test_and_set();
+    std::unique_lock lock(m_padLayerStopMutex);
+    if (!m_padFrameInProgress.load())
+        return;
+    if (!m_padLayerStopCondVar.wait_for(lock, std::chrono::milliseconds(2000), [this] { return !m_padFrameInProgress.load(); }))
+        cemuLog_log(LogType::Force, "Metal: timed out waiting for the render thread to leave its DRC frame; tearing the layer down anyway");
+}
+
+void MetalRenderer::EndPadFrame()
+{
+    {
+        std::lock_guard lock(m_padLayerStopMutex);
+        m_padFrameInProgress.store(false);
+    }
+    m_padLayerStopCondVar.notify_all();
 }
 
 void MetalRenderer::Flush(bool waitIdle)
@@ -1021,7 +1083,11 @@ void MetalRenderer::texture_loadSlice(LatteTexture* hostTexture, sint32 width, s
         sliceIndex = 0;
     }
 
-    size_t bytesPerRow = GetMtlTextureBytesPerRow(textureMtl->format, textureMtl->isDepth, width);
+    // the source is the texture decoder's staging buffer, so the row stride is the staging stride, not
+    // the MTL aspect texel size (they differ for the combined depth/stencil formats, whose staging is
+    // interleaved 8-byte texels). Note the two blits below still read the depth and stencil aspects
+    // separately out of that layout, which is what BlitOption*FromDepthStencil expects
+    size_t bytesPerRow = GetMtlTextureStagingBytesPerRow(textureMtl->format, textureMtl->isDepth, width);
     // No need to set bytesPerImage for 3D textures, since we always load just one slice
     //size_t bytesPerImage = GetMtlTextureBytesPerImage(textureMtl->GetFormat(), textureMtl->isDepth, height, bytesPerRow);
     //if (m_isAppleGPU)
@@ -1203,35 +1269,15 @@ void MetalRenderer::texture_copyImageSubData(LatteTexture* src, sint32 srcMip, s
         }
     }
 
-    // Copy provenance (see LatteTextureMtl::MarkCopyMipsWritten). Classify the copy by what it does
-    // to the destination level, which decides whether that level's content counts as the game's own:
-    // fully covered from a same-sized source level (carried over 1:1), fully covered from a
-    // differently sized source (a deliberate resample - how a game builds its own mip chain by
-    // copying a larger level into a smaller one), or only partly covered (a crop pasted into the
-    // level, leaving the rest of it as whatever was there before).
-    //
-    // This runs AFTER the clamp above deliberately. Callers pass the copy region in the textures'
-    // base/effective space (LatteTexture_CopySlice scales it to effective size but does not shift it
-    // by the mip), so for any copy into an upper mip the region arrives larger than that mip and the
-    // clamp is what brings it down to the level. Classifying before the clamp compared the
-    // unclamped region against the mip's own size, so a copy that ends up covering the entire
-    // destination level was recorded as Partial - which is not "partly covered", and which marks the
-    // level untrustworthy and arms the sample-time clamp and the mip regeneration against a chain
-    // the game wrote correctly.
+    // Copy provenance (see LatteTextureMtl::MarkCopyMipsWritten), classified after the clamp above, which
+    // brings the region down to the level: Matched = level fully covered from a same-sized source level,
+    // Resampled = fully covered from a differently sized one, Partial = a crop (only Partial is never trusted)
     sint32 srcLevelWidth = 0, srcLevelHeight = 0, dstLevelWidth = 0, dstLevelHeight = 0;
     src->GetEffectiveSize(srcLevelWidth, srcLevelHeight, srcMip);
     dst->GetEffectiveSize(dstLevelWidth, dstLevelHeight, dstMip);
-    // The caller's region is always in the textures' effective (resolution-overwrite) space:
-    // LatteTexture_CopySlice runs it through LatteTexture_scaleToEffectiveSize. It does not, however,
-    // shift it by the mip the way GetEffectiveSize does, and the two orderings do not round the same
-    // way when the overwrite ratio is not a power of two (808/264 is not 3), so the region can come
-    // out a row or two short of the level the MTL texture actually has - measured: a 180x99 region
-    // against a 180x101 mip 3. That shortfall is real, but treating it as Partial is not: Partial
-    // means "a crop pasted into the level, leaving the rest as whatever was there before", whereas
-    // this is a whole-level copy whose scaled extent rounds down. Since Partial is the one provenance
-    // the trust rule never accepts, the distinction decides whether a level is trusted at all. The
-    // tolerance is the integer-division bound of the scaling above, not a value chosen to pass a
-    // case; a real crop still shows up as a non-zero offset, which is checked unconditionally
+    // the region is scaled to effective size before the mip shift (LatteTexture_CopySlice), so a
+    // non-power-of-two resolution ratio can round it one texel short of the level: coversLevel allows
+    // exactly that integer-division bound, and a real crop still shows up as a non-zero offset
     const auto coversLevel = [](sint32 w, sint32 h, sint32 levelW, sint32 levelH) {
         return w <= levelW && h <= levelH && w >= levelW - 1 && h >= levelH - 1;
     };
@@ -1341,7 +1387,7 @@ void MetalRenderer::texture_copyImageSubData(LatteTexture* src, sint32 srcMip, s
 			return;
 		effectiveCopyWidth = (sint32)(srcBlockCountX * srcInfo.blockTexelSize.x);
 		effectiveCopyHeight = (sint32)(srcBlockCountY * srcInfo.blockTexelSize.y);
-		const uint32 bytesPerRow = srcBlockCountX * srcInfo.bytesPerBlock;
+		const uint32 bytesPerRow = srcBlockCountX * (uint32)srcInfo.bytesPerBlock;
 		const uint32 bytesPerImage = bytesPerRow * srcBlockCountY;
 		const uint64 copyBytes = (uint64)bytesPerImage * copySliceCount;
 
@@ -1452,7 +1498,11 @@ void MetalRenderer::texture_copyImageSubData(LatteTexture* src, sint32 srcMip, s
 LatteTextureReadbackInfo* MetalRenderer::texture_createReadback(LatteTextureView* textureView)
 {
     auto* baseTexture = static_cast<LatteTextureMtl*>(textureView->baseTexture);
-    if (baseTexture->m_isAlternateFormat)
+    // compressed formats are refused like Vulkan does: the blit would use a block-based row pitch,
+    // Metal requires block-aligned copy extents, and the consumer (LatteTextureLoader) has no
+    // compressed readback path at all - so the transfer would be wasted work that can also trip
+    // validation
+    if (baseTexture->m_isAlternateFormat || Latte::IsCompressedFormat(baseTexture->format))
     {
         cemuLog_logDebug(LogType::Force, "Metal does not support readback of texture format 0x{:x}", (uint32)baseTexture->format);
         return nullptr;
@@ -1716,10 +1766,8 @@ bool MetalRenderer::depthCopy_ensureColorCopy(LatteTextureView* textureView, MTL
 	const bool isArray = (srcTextureType == MTL::TextureType2DArray);
 	const NS::UInteger arrayLength = isArray ? depthTexture->arrayLength() : 1;
 
-	// R32Float is only filterable on Apple GPUs (needed for generateMipmaps and for sampling the
-	// mirror with the game's linear filters); other vendors use R16Float. Depth values are
-	// normalized to [0,1], which R16Float represents with adequate precision
-	const MTL::PixelFormat mirrorFormat = m_device->supportsFamily(MTL::GPUFamilyApple7) ? MTL::PixelFormatR32Float : MTL::PixelFormatR16Float;
+	// the mirror must be filterable (generateMipmaps, game linear filters): R32Float whenever the device can filter it; R16Float is a lossy fallback
+	const MTL::PixelFormat mirrorFormat = m_device->supports32BitFloatFiltering() ? MTL::PixelFormatR32Float : MTL::PixelFormatR16Float;
 
 	auto colorCopy = texMtl->GetDepthColorCopy();
 	if (colorCopy && (colorCopy->width() != depthTexture->width() || colorCopy->height() != depthTexture->height() ||
@@ -1736,7 +1784,10 @@ bool MetalRenderer::depthCopy_ensureColorCopy(LatteTextureView* textureView, MTL
 		desc->setPixelFormat(mirrorFormat);
 		desc->setWidth(depthTexture->width());
 		desc->setHeight(depthTexture->height());
-		desc->setMipmapLevelCount(depthTexture->mipmapLevelCount()); // keep the full mip chain so LOD selection behaves like on Vulkan
+		// the mirror has a level per source level so a sampled view can reach the same range as on
+		// Vulkan, but only level 0 is copied - depthCopy_encodeCopies fills the rest with
+		// generateMipmaps, i.e. a box filter of level 0 rather than the game's own deeper levels
+		desc->setMipmapLevelCount(depthTexture->mipmapLevelCount());
 		desc->setArrayLength(arrayLength); // mirror the whole array so per-layer sample views work
 		// PixelFormatView: swizzled sample views are created from the mirror (same pixel format
 		// today, but the swizzle-taking newTextureView variants require the usage flag)
@@ -1749,7 +1800,8 @@ bool MetalRenderer::depthCopy_ensureColorCopy(LatteTextureView* textureView, MTL
 			return false;
 		}
 		// labeled so the texture is identifiable in GPU captures
-		colorCopy->setLabel(ToNSString("Cemu DepthMirror"));
+		if (IsTracingToolEnabled())
+			colorCopy->setLabel(ToNSString("Cemu DepthMirror"));
 		texMtl->SetDepthColorCopy(colorCopy, 0);
 	}
 
@@ -1932,19 +1984,15 @@ MTL::Texture* MetalRenderer::GetFeedbackShadowSampleView(FeedbackShadowCopy& sha
 // buffer. A side command buffer would commit ahead of the main one (same-queue execution is
 // commit-ordered) and could read stale depth. BindStageResources then only binds the mirror.
 
-// Regenerates never-written upper mip levels of sampled effect buffers from their fresh
-// render/copy-written mip0. Some games (SM3DW's DoF chain) sample effect buffers through their
-// full mip chain with forced LODs while only mip 0 ever receives game content (render passes
-// write mip 0; the upper levels of these pack-resized chains are never managed by the game).
-// Serving the stale upper levels diverges from Vulkan. Detect such chains here (mip 0 GPU-written,
-// the sampled levels not trustworthy - see LatteTextureMtl::RangeContentIsTrustworthy - filterable
-// FLOAT format, sampled view reaches mip >= 1) and regenerate the upper levels via the blit
-// encoder's generateMipmaps (box filter) in the pass-break window, so the copies are strictly
-// ordered before the draw. Regeneration runs once per mip0 content update, tracked via the
-// texture's write event counter, which the copy paths feed. Runs BEFORE
-// PrepareFeedbackLoopShadowCopies so feedback shadow copies pick up the regenerated levels
+// Opt-in workaround: regenerates the never-written upper levels of a sampled, GPU-written chain from
+// mip 0 (generateMipmaps, once per mip 0 update). Vulkan serves those levels as-is; this deliberately
+// deviates. Runs in the pass-break window before PrepareFeedbackLoopShadowCopies, so shadows see it
 void MetalRenderer::EnsureSampledMipContentValid(LatteDecompilerShader* vertexShader, LatteDecompilerShader* geometryShader, LatteDecompilerShader* pixelShader)
 {
+	// off by default: General Settings -> Graphics -> "Mip chain workarounds", shared with the clamp in
+	// BindStageResources
+	if (!GetConfig().mtl_sampled_mip_workarounds.GetValue())
+		return;
 	// the texture plus the sampling unit that asked for it - the unit is what makes the decision
 	// interesting (a unit that pins one LOD above 0 reads a specific level, one with a range reads
 	// the pyramid), and it is reported in the diagnostic below
@@ -1982,54 +2030,46 @@ void MetalRenderer::EnsureSampledMipContentValid(LatteDecompilerShader* vertexSh
 			LatteTexture* baseTexture = textureView->baseTexture;
 			if (baseTexture->isDepth || baseTexture->Is3DTexture())
 				continue;
-		// the sampled view must be able to reach an upper mip
-		if (textureView->firstMip + textureView->numMip <= 1)
-			continue;
-		auto texMtl = static_cast<LatteTextureMtl*>(baseTexture);
-		if (baseTexture->mipLevels <= 1)
-			continue;
-		// Only regenerate when a level this draw samples is NOT trustworthy - the same question the
-		// sample-time clamp answers, from the other side (LatteTextureMtl::RangeContentIsTrustworthy).
-		// Untrustworthy means a copy left a re-crop of another incarnation's content in that level,
-		// or nobody wrote it (the chains this exists for: SM3DW samples a chain it never fills).
-		// A trustworthy range is served as the game asked - regenerating it replaces correct content
-		// with a box filter of mip 0, the dithering this caused on MK8. The verdict is per sampled
-		// view, not per chain, so a chain with one questionable level is not rebuilt for a draw that
-		// never reads it. mip 0 must be GPU-written: it is the generation source, and requiring it
-		// excludes CPU-uploaded asset textures, whose valid chains must never be replaced
-		if ((texMtl->GetRenderWrittenMipMask() & 1u) == 0)
-			continue;
-		// Only regenerate a chain the game never manages. If any level above mip 0 carries any write
-		// provenance at all - even a partial copy - the game is building this chain itself, and
-		// generateMipmaps would overwrite levels it wrote with a box filter of mip 0. Measured: a
-		// DoF/bloom chain whose levels 0..2 arrive as resampled copies and whose last level is a
-		// partial copy was regenerated on every draw of the session, destroying the game's own
-		// pyramid each frame. The mechanism exists for chains whose upper levels are NEVER written,
-		// which is what this tests; a partially-written level is not that case
-		{
-			const uint32 anyUpperProvenance =
-				(texMtl->GetPassWrittenMipMask() | texMtl->GetMatchedCopyMipMask() |
-				 texMtl->GetResampledCopyMipMask() | texMtl->GetPartialCopyMipMask()) & ~1u;
-			if (anyUpperProvenance != 0)
+			// the sampled view must be able to reach an upper mip
+			if (textureView->firstMip + textureView->numMip <= 1)
 				continue;
-		}
-		// generateMipmaps needs a filterable format AND color renderability - Metal implements
-		// it as render passes, and BC/compressed formats are filterable but NOT renderable
-		// (validation aborts the blit). The clamp class in BindStageResources still covers
-		// compressed chains safely (single-level views of compressed textures are legal)
-		if (GetMtlPixelFormatInfo(baseTexture->format, false).dataType != MetalDataType::FLOAT)
-			continue;
-		if (!FormatIsRenderable(baseTexture->format))
-			continue;
-		// Regenerating once per mip 0 content update is required: skipping it loses MK8's bloom and
-		// DoF, so the generated upper levels are read even when the written masks say otherwise
-		if (texMtl->GetMipGenerationEventCounter() == baseTexture->lastWriteEventCounter)
-			continue;
-		const bool alreadyQueued = std::any_of(toGenerate.begin(), toGenerate.end(),
-			[&](const ChainToGenerate& entry) { return entry.texMtl == texMtl; });
-		if (alreadyQueued)
-			continue;
-		toGenerate.push_back({ texMtl, shader, relative_textureUnit });
+			auto texMtl = static_cast<LatteTextureMtl*>(baseTexture);
+			if (baseTexture->mipLevels <= 1)
+				continue;
+			// mip 0 must be GPU-written: it is the generation source, and requiring it excludes CPU-uploaded
+			// asset textures, whose valid chains must never be replaced.
+			// Note this is NOT the sample-time clamp's predicate (RangeContentIsTrustworthy, which is
+			// evaluated per sampled view over the levels the LOD window can reach). The gate below is
+			// chain-wide and stricter: it regenerates only when no upper level carries any provenance
+			if ((texMtl->GetRenderWrittenMipMask() & 1u) == 0)
+				continue;
+			// only a chain the game never manages: any provenance above mip 0 (pass write, any copy, a
+			// clear) means the game builds it, and generateMipmaps would overwrite its levels. Clears
+			// count because LevelContentIsTrustworthy treats them as game content (no clamp would follow)
+			{
+				const uint32 anyUpperProvenance =
+					(texMtl->GetPassWrittenMipMask() | texMtl->GetMatchedCopyMipMask() |
+					 texMtl->GetResampledCopyMipMask() | texMtl->GetPartialCopyMipMask() |
+					 texMtl->GetClearedMipMask()) & ~1u;
+				if (anyUpperProvenance != 0)
+					continue;
+			}
+			// generateMipmaps needs a filterable format AND color renderability - Metal implements
+			// it as render passes, and BC/compressed formats are filterable but NOT renderable
+			// (validation aborts the blit). The clamp class in BindStageResources still covers
+			// compressed chains safely (single-level views of compressed textures are legal)
+			if (GetMtlPixelFormatInfo(baseTexture->format, false).dataType != MetalDataType::FLOAT)
+				continue;
+			if (!FormatIsRenderable(baseTexture->format))
+				continue;
+			// already regenerated from the current mip 0 content (write event counter)
+			if (texMtl->GetMipGenerationEventCounter() == baseTexture->lastWriteEventCounter)
+				continue;
+			const bool alreadyQueued = std::any_of(toGenerate.begin(), toGenerate.end(),
+				[&](const ChainToGenerate& entry) { return entry.texMtl == texMtl; });
+			if (alreadyQueued)
+				continue;
+			toGenerate.push_back({ texMtl, shader, relative_textureUnit });
 		}
 	}
 	if (toGenerate.empty())
@@ -2084,7 +2124,33 @@ void MetalRenderer::PrepareFeedbackLoopShadowCopies(LatteDecompilerShader* verte
 	m_feedbackShadowTextures.clear();
 	const auto& fbo = m_state.m_activeFBO.m_fbo;
 
-	std::vector<std::pair<LatteTexture*, LatteTextureView*>> toCopy;
+	// one entry per base texture: the union of the mip/slice ranges its feedback units sample
+	struct FeedbackCopy
+	{
+		LatteTexture* baseTexture;
+		LatteTextureView* firstView; // the first unit's view, for the debug log
+		uint32 firstMip, endMip;     // half-open
+		uint32 firstSlice, endSlice; // half-open
+		bool servedFromShadow;       // a unit reads an attached mip/slice, so every unit of this texture reads the shadow
+	};
+	std::vector<FeedbackCopy> toCopy;
+	// does [firstMip,endMip) x [firstSlice,endSlice) of baseTexture intersect a mip/slice the active pass renders to?
+	// Only those reads need a shadow copy: the other subresources of an attached texture are sampled directly
+	const auto overlapsAttachment = [&](LatteTexture* baseTexture, uint32 firstMip, uint32 endMip, uint32 firstSlice, uint32 endSlice)
+	{
+		for (int c = 0; c < 8; c++)
+		{
+			const LatteTextureView* attachment = fbo->colorBuffer[c].texture;
+			if (!attachment || attachment->baseTexture != baseTexture)
+				continue;
+			const uint32 attachmentMip = (uint32)attachment->firstMip;
+			const uint32 attachmentFirstSlice = (uint32)attachment->firstSlice;
+			const uint32 attachmentEndSlice = attachmentFirstSlice + std::max<uint32>((uint32)attachment->numSlice, 1);
+			if (attachmentMip >= firstMip && attachmentMip < endMip && attachmentFirstSlice < endSlice && firstSlice < attachmentEndSlice)
+				return true;
+		}
+		return false;
+	};
 	const auto scanShader = [&](LatteDecompilerShader* shader)
 	{
 		if (!shader)
@@ -2130,8 +2196,7 @@ void MetalRenderer::PrepareFeedbackLoopShadowCopies(LatteDecompilerShader* verte
 			if (!fbo)
 				continue; // no active FBO: no color feedback loop possible, depth refresh was the only work
 			const bool isAttachment = TextureIsActiveColorAttachment(baseTexture);
-			const bool alreadyQueued = std::any_of(toCopy.begin(), toCopy.end(), [baseTexture](const auto& entry) { return entry.first == baseTexture; });
-			if (!isAttachment || alreadyQueued)
+			if (!isAttachment)
 				continue;
 
 			auto texMtl = static_cast<LatteTextureMtl*>(baseTexture);
@@ -2145,6 +2210,37 @@ void MetalRenderer::PrepareFeedbackLoopShadowCopies(LatteDecompilerShader* verte
 				continue;
 			}
 
+			// the range the sample view reads (mirrors CreateFeedbackShadowView), clamped to the texture
+			const uint32 levels = (uint32)src->mipmapLevelCount();
+			const uint32 firstMip = std::min<uint32>(textureView->firstMip, levels - 1);
+			const uint32 endMip = std::min<uint32>(firstMip + std::max<uint32>(textureView->numMip, 1), levels);
+			uint32 firstSlice = 0, endSlice = 1;
+			if (src->textureType() == MTL::TextureType2DArray)
+			{
+				// keyed on the SOURCE type: a DIM_2D view of slice N of an array texture reads slice N
+				const uint32 layers = (uint32)src->arrayLength();
+				const bool viewIsLayered = (textureView->dim == Latte::E_DIM::DIM_2D_ARRAY || textureView->dim == Latte::E_DIM::DIM_CUBEMAP);
+				firstSlice = std::min<uint32>(textureView->firstSlice, layers - 1);
+				endSlice = std::min<uint32>(firstSlice + (viewIsLayered ? std::max<uint32>(textureView->numSlice, 1) : 1), layers);
+			}
+			auto queued = std::find_if(toCopy.begin(), toCopy.end(), [baseTexture](const FeedbackCopy& c) { return c.baseTexture == baseTexture; });
+			if (queued == toCopy.end())
+			{
+				toCopy.push_back({ baseTexture, textureView, firstMip, endMip, firstSlice, endSlice, false });
+				queued = std::prev(toCopy.end());
+			}
+			else
+			{
+				// another unit of this draw samples the same texture. The shadow substitution is per texture
+				// (m_feedbackShadowTextures), so if any unit needs the shadow it serves all of them: copy the union
+				queued->firstMip = std::min(queued->firstMip, firstMip);
+				queued->endMip = std::max(queued->endMip, endMip);
+				queued->firstSlice = std::min(queued->firstSlice, firstSlice);
+				queued->endSlice = std::max(queued->endSlice, endSlice);
+			}
+			if (queued->servedFromShadow || !overlapsAttachment(baseTexture, firstMip, endMip, firstSlice, endSlice))
+				continue;
+
 			auto& shadowEntry = m_feedbackShadowCopies[baseTexture];
 			if (!shadowEntry.texture || shadowEntry.pixelFormat != src->pixelFormat() || shadowEntry.textureType != src->textureType() ||
 				shadowEntry.width != src->width() || shadowEntry.height != src->height() ||
@@ -2155,6 +2251,7 @@ void MetalRenderer::PrepareFeedbackLoopShadowCopies(LatteDecompilerShader* verte
 					// cached sample views reference the old shadow texture - drop them with it
 					shadowEntry.releaseSampleViews();
 					shadowEntry.texture->release();
+					shadowEntry.texture = nullptr;
 				}
 				NS_STACK_SCOPED MTL::TextureDescriptor* desc = MTL::TextureDescriptor::alloc()->init();
 				desc->setTextureType(src->textureType());
@@ -2168,14 +2265,6 @@ void MetalRenderer::PrepareFeedbackLoopShadowCopies(LatteDecompilerShader* verte
 				// require the usage flag)
 				desc->setUsage(MTL::TextureUsageShaderRead | MTL::TextureUsagePixelFormatView);
 				shadowEntry.texture = m_device->newTexture(desc);
-				// labeled so the texture is identifiable in GPU captures
-				shadowEntry.texture->setLabel(ToNSString(fmt::format("Cemu Feedback Shadow {:016x}", baseTexture->physAddress)));
-				shadowEntry.pixelFormat = src->pixelFormat();
-				shadowEntry.textureType = src->textureType();
-				shadowEntry.width = src->width();
-				shadowEntry.height = src->height();
-				shadowEntry.mipLevels = src->mipmapLevelCount();
-				shadowEntry.arrayLength = src->arrayLength();
 				if (!shadowEntry.texture)
 				{
 					MetalDiag_Count(MetalDiagEvent::FeedbackLoopUnsupported,
@@ -2183,14 +2272,25 @@ void MetalRenderer::PrepareFeedbackLoopShadowCopies(LatteDecompilerShader* verte
 					m_feedbackShadowCopies.erase(baseTexture);
 					continue;
 				}
+				// labeled so the texture is identifiable in GPU captures
+				if (IsTracingToolEnabled())
+					shadowEntry.texture->setLabel(ToNSString(fmt::format("Cemu Feedback Shadow {:016x}", baseTexture->physAddress)));
+				shadowEntry.pixelFormat = src->pixelFormat();
+				shadowEntry.textureType = src->textureType();
+				shadowEntry.width = (uint32)src->width();
+				shadowEntry.height = (uint32)src->height();
+				shadowEntry.mipLevels = (uint32)src->mipmapLevelCount();
+				shadowEntry.arrayLength = (uint32)src->arrayLength();
 			}
-			toCopy.emplace_back(baseTexture, textureView);
+			queued->servedFromShadow = true;
 			m_feedbackShadowTextures[baseTexture] = shadowEntry.texture;
 		}
 	};
 	scanShader(vertexShader);
 	scanShader(geometryShader);
 	scanShader(pixelShader);
+	// textures none of whose units read an attached mip/slice are sampled directly: no copy, no pass break
+	std::erase_if(toCopy, [](const FeedbackCopy& c) { return !c.servedFromShadow; });
 	if (toCopy.empty())
 		return;
 
@@ -2202,15 +2302,16 @@ void MetalRenderer::PrepareFeedbackLoopShadowCopies(LatteDecompilerShader* verte
 			toCopy.size(), LatteGPUState.frameCounter, pixelShader ? pixelShader->baseHash : 0);
 		// geometry diagnostics: a mismatch between the copied extent and the region the render pass
 		// actually wrote (e.g. padding bands, resolution overwrite) shows up as blocky post effects
-		for (const auto& [baseTexture, textureView] : toCopy)
+		for (const auto& copy : toCopy)
 		{
-			auto texMtl = static_cast<LatteTextureMtl*>(baseTexture);
+			auto texMtl = static_cast<LatteTextureMtl*>(copy.baseTexture);
 			MTL::Texture* src = texMtl->GetTexture();
-			cemuLog_logDebug(LogType::Force, "MetalRenderer: feedback copy for texture {:016x}: {}x{} mips {} layers {} fmt {}, FBO render size {}x{}, sampled view mips {}+{} slices {}+{}, base fmt {} vs view fmt {}",
-				baseTexture->physAddress, src->width(), src->height(), src->mipmapLevelCount(), (uint32)src->arrayLength(), (uint32)src->pixelFormat(),
+			cemuLog_logDebug(LogType::Force, "MetalRenderer: feedback copy for texture {:016x}: {}x{} mips {} layers {} fmt {}, FBO render size {}x{}, sampled view mips {}+{} slices {}+{}, copied mips [{},{}) slices [{},{}), base fmt {} vs view fmt {}",
+				copy.baseTexture->physAddress, src->width(), src->height(), src->mipmapLevelCount(), (uint32)src->arrayLength(), (uint32)src->pixelFormat(),
 				m_state.m_activeFBO.m_fbo->m_size.x, m_state.m_activeFBO.m_fbo->m_size.y,
-				textureView->firstMip, textureView->numMip, textureView->firstSlice, textureView->numSlice,
-				(uint32)texMtl->format, (uint32)textureView->format);
+				copy.firstView->firstMip, copy.firstView->numMip, copy.firstView->firstSlice, copy.firstView->numSlice,
+				copy.firstMip, copy.endMip, copy.firstSlice, copy.endSlice,
+				(uint32)texMtl->format, (uint32)copy.firstView->format);
 		}
 	}
 
@@ -2220,12 +2321,12 @@ void MetalRenderer::PrepareFeedbackLoopShadowCopies(LatteDecompilerShader* verte
 	EndEncoding();
 	auto commandBuffer = GetCommandBuffer();
 	auto blitEncoder = commandBuffer->blitCommandEncoder();
-	for (const auto& [baseTexture, textureView] : toCopy)
+	for (const auto& copy : toCopy)
 	{
-		auto texMtl = static_cast<LatteTextureMtl*>(baseTexture);
+		auto texMtl = static_cast<LatteTextureMtl*>(copy.baseTexture);
 		MTL::Texture* src = texMtl->GetTexture();
-		MTL::Texture* dst = m_feedbackShadowCopies[baseTexture].texture;
-		blitEncoder->copyFromTexture(src, 0, 0, dst, 0, 0, src->arrayLength(), src->mipmapLevelCount());
+		MTL::Texture* dst = m_feedbackShadowCopies[copy.baseTexture].texture;
+		blitEncoder->copyFromTexture(src, copy.firstSlice, copy.firstMip, dst, copy.firstSlice, copy.firstMip, copy.endSlice - copy.firstSlice, copy.endMip - copy.firstMip);
 	}
 	blitEncoder->endEncoding();
 	// open the fresh pass for the feedback draw (the caller's GetRenderCommandEncoder() will reuse it)
@@ -2444,11 +2545,8 @@ void MetalRenderer::draw_execute(uint32 baseVertex, uint32 baseInstance, uint32 
     bool usesGeometryShader = UseGeometryShader(LatteGPUState.contextNew, geometryShader != nullptr);
     if (usesGeometryShader && !m_supportsMeshShaders)
     {
-        // The mesh path is Metal's only geometry-shader emulation, and RECTS rides the same path
-        // (UseGeometryShader is hasGeometryShader || UseRectEmulation) - so on a device without
-        // mesh shader support there is no route for this draw and it is dropped. Report it: the
-        // skip used to be silent in the frame and in the log, which made "geometry is missing here"
-        // indistinguishable from a game that simply draws nothing.
+        // geometry shaders and RECTS are only emulated on the mesh path, so without mesh shader support
+        // the draw is dropped - reported, so missing geometry is distinguishable from a game drawing nothing
         MetalDiag_CountOncePer(MetalDiagEvent::GeometryShaderUnsupported,
             (uintptr_t)(geometryShader ? geometryShader->baseHash : 0),
             "geometry shader {:016x}_{:016x}{} skipped - no mesh shader support on this device",
@@ -2691,7 +2789,13 @@ void MetalRenderer::draw_execute(uint32 baseVertex, uint32 baseInstance, uint32 
         // against the render target size; attachment-less passes render into a 1x1 dummy texture)
         uint32 passWidth;
         uint32 passHeight;
-        if (m_state.m_activeFBO.m_fbo->colorBuffer[0].texture == nullptr && m_state.m_activeFBO.m_fbo->depthBuffer.texture == nullptr)
+        // "attachment-less" means no color slot AND no depth - the same predicate
+        // ApplyDummyColorAttachmentIfEmpty uses for the 1x1 dummy (slot 0 can be empty while a later
+        // target is bound)
+        bool hasAnyAttachment = m_state.m_activeFBO.m_fbo->depthBuffer.texture != nullptr;
+        for (uint8 i = 0; i < LATTE_NUM_COLOR_TARGET && !hasAnyAttachment; i++)
+            hasAnyAttachment = m_state.m_activeFBO.m_fbo->colorBuffer[i].texture != nullptr;
+        if (!hasAnyAttachment)
         {
             passWidth = 1;
             passHeight = 1;
@@ -2702,17 +2806,17 @@ void MetalRenderer::draw_execute(uint32 baseVertex, uint32 baseInstance, uint32 
             passHeight = (uint32)std::max(m_state.m_activeFBO.m_fbo->m_size.y, 1);
         }
         MTL::ScissorRect scissor = m_state.m_scissor;
-        scissor.x = std::min<uint32>(scissor.x, passWidth - 1);
-        scissor.y = std::min<uint32>(scissor.y, passHeight - 1);
-        scissor.width = std::min<uint32>(scissor.width, passWidth - scissor.x);
-        scissor.height = std::min<uint32>(scissor.height, passHeight - scissor.y);
+        scissor.x = std::min<uint32>((uint32)scissor.x, passWidth - 1);
+        scissor.y = std::min<uint32>((uint32)scissor.y, passHeight - 1);
+        scissor.width = std::min<uint32>((uint32)scissor.width, passWidth - (uint32)scissor.x);
+        scissor.height = std::min<uint32>((uint32)scissor.height, passHeight - (uint32)scissor.y);
         // Metal requires non-empty scissors within the target. Zero-fragment scissors (guest
         // fully outside / zero extent) are skipped upstream in draw_execute unless streamout is
         // active; only those reach this point, so clamp to a single texel at the target edge
         // (Vulkan-parity residual: that texel's fragment still executes, but the streamout
         // capture we keep the draw alive for is vertex-side and unaffected)
-        scissor.width = std::max<uint32>(scissor.width, 1);
-        scissor.height = std::max<uint32>(scissor.height, 1);
+        scissor.width = std::max<uint32>((uint32)scissor.width, 1);
+        scissor.height = std::max<uint32>((uint32)scissor.height, 1);
 
         // store the RAW guest scissor for the comparison above - storing the clamped rect would
         // compare unequal against the still-unclamped state and re-issue setScissorRect every
@@ -2767,14 +2871,22 @@ void MetalRenderer::draw_execute(uint32 baseVertex, uint32 baseInstance, uint32 
 
 		// mesh-path vertex shaders get the vertex count via a dedicated binding: the SupportBuffer
 		// stays byte-identical to the Vulkan ufBlock, which only carries verticesPerInstance for
-		// the SSBO streamout path
-		sint32 meshVerticesPerInstance = (sint32)count;
+		// the SSBO streamout path.
+		// It must be the HOST indices per instance, not the guest vertex count: the object shader
+		// derives the instance id as vid / verticesPerInstance, and vid indexes the index space
+		// LatteIndices_decode produced - which grew for the modes it rewrites (LINE_LOOP gains one
+		// connecting vertex, QUADS/QUAD_STRIP become six indices per quad, TRIANGLE_FAN three per
+		// triangle). With the guest count the tail of each instance's vertices is fetched as the next instance
+		const bool indexSpaceRewritten = (primitiveMode == LattePrimitiveMode::LINE_LOOP ||
+			primitiveMode == LattePrimitiveMode::QUADS || primitiveMode == LattePrimitiveMode::QUAD_STRIP ||
+			primitiveMode == LattePrimitiveMode::TRIANGLE_FAN);
+		sint32 meshVerticesPerInstance = (sint32)(indexSpaceRewritten ? hostIndexCount : count);
 		renderCommandEncoder->setObjectBytes(&meshVerticesPerInstance, sizeof(meshVerticesPerInstance), vertexShader->resourceMapping.verticesPerInstanceBinding);
 		encoderState.m_buffers[METAL_SHADER_TYPE_OBJECT][vertexShader->resourceMapping.verticesPerInstanceBinding] = {nullptr};
 
 		// one object threadgroup per input primitive. The per-primitive vertex count and the
 		// threadgroup count must be derived from the data the index decoder produced (QUADS and
-		// QUAD_STRIP arrive as triangle lists, TRIANGLE_FAN as a triangle strip, LINE_LOOP as a
+		// QUAD_STRIP arrive as triangle lists, TRIANGLE_FAN as a triangle list, LINE_LOOP as a
 		// reconnecting line strip) - a single generic formula cannot express all of these
 		uint32 verticesPerPrimitive = GetVerticesPerPrimitive(primitiveMode);
 		uint32 threadgroupCount;
@@ -2798,12 +2910,12 @@ void MetalRenderer::draw_execute(uint32 baseVertex, uint32 baseInstance, uint32 
 			threadgroupCount = count / 3;
 			break;
 		case LattePrimitiveMode::TRIANGLE_STRIP:
-		case LattePrimitiveMode::TRIANGLE_FAN:
 			threadgroupCount = (count >= 3) ? count - 2 : 0;
 			break;
 		case LattePrimitiveMode::QUADS:
 		case LattePrimitiveMode::QUAD_STRIP:
-			// rewritten into triangle lists (6 indices per quad)
+		case LattePrimitiveMode::TRIANGLE_FAN:
+			// rewritten into triangle lists (6 indices per quad, 3 per fan triangle)
 			threadgroupCount = hostIndexCount / 3;
 			break;
 		default:
@@ -2813,20 +2925,25 @@ void MetalRenderer::draw_execute(uint32 baseVertex, uint32 baseInstance, uint32 
 		}
 		threadgroupCount *= instanceCount;
 
-	// Metal rejects zero-size mesh grids - skip only the draw call, the post-draw bookkeeping
-	// below must still run
-	if (threadgroupCount > 0)
-		renderCommandEncoder->drawMeshThreadgroups(MTL::Size(threadgroupCount, 1, 1), MTL::Size(verticesPerPrimitive, 1, 1), MTL::Size(1, 1, 1));
+		// Metal rejects zero-size mesh grids - skip only the draw call, the post-draw bookkeeping
+		// below must still run
+		if (threadgroupCount > 0)
+		{
+			MarkPassAttachmentsWritten();
+			renderCommandEncoder->drawMeshThreadgroups(MTL::Size(threadgroupCount, 1, 1), MTL::Size(verticesPerPrimitive, 1, 1), MTL::Size(1, 1, 1));
+		}
 	}
 	else
 	{
         if (hostIndexType != INDEX_TYPE::NONE)
        	{
        	    auto mtlIndexType = GetMtlIndexType(hostIndexType);
+       		MarkPassAttachmentsWritten();
       		renderCommandEncoder->drawIndexedPrimitives(mtlPrimitiveType, hostIndexCount, mtlIndexType, indexAllocationMtl->mtlBuffer, indexAllocationMtl->bufferOffset, instanceCount, baseVertex, baseInstance);
        	}
        	else
        	{
+      		MarkPassAttachmentsWritten();
       		renderCommandEncoder->drawPrimitives(mtlPrimitiveType, baseVertex, count, instanceCount, baseInstance);
        	}
 	}
@@ -2835,7 +2952,10 @@ void MetalRenderer::draw_execute(uint32 baseVertex, uint32 baseInstance, uint32 
 
 	// Occlusion queries
 	if (m_occlusionQuery.m_active)
+	{
 	    m_occlusionQuery.m_currentIndex = (m_occlusionQuery.m_currentIndex + 1) % OCCLUSION_QUERY_POOL_SIZE;
+	    m_occlusionQuery.m_countedDraws++;
+	}
 
 	// Streamout
 	LatteStreamout_FinishDrawcall(m_memoryManager->UseHostMemoryForCache());
@@ -2977,17 +3097,19 @@ void MetalRenderer::occlusionQuery_updateState() {
 
 void MetalRenderer::SetBuffer(MTL::RenderCommandEncoder* renderCommandEncoder, MetalShaderType shaderType, MTL::Buffer* buffer, size_t offset, uint32 index)
 {
-    if (offset >= buffer->length())
+    if (!buffer || offset >= buffer->length())
     {
-        // empty range at the end of the buffer (e.g. a zero-sized uniform buffer bound at the end
-        // of the buffer cache). Vulkan accepts offset == length with an empty range, Metal rejects
-        // it - skip the bind, which is equivalent (the shader cannot read data from an empty range).
-        // Clear the state-cache entry so the stale binding from a previous draw isn't kept alive
-        // in the state tracking (and would never be re-bound when the same buffer+offset recurs)
-        auto& boundBuffer = m_state.m_encoderState.m_buffers[shaderType][index];
-        boundBuffer.m_buffer = nullptr;
-        boundBuffer.m_offset = 0;
-        return;
+        // empty range (e.g. a zero-sized uniform buffer bound at the end of the buffer cache): Vulkan
+        // accepts offset == length, Metal rejects it. Skipping the bind would leave the previous buffer
+        // bound at this index, but the shader must not read real data from an empty range - bind zeros
+        // instead (64 KiB covers a full uniform block, 4096 vec4) through the normal state-cached path
+        if (!m_emptyBuffer)
+        {
+            m_emptyBuffer = m_device->newBuffer(64 * 1024, MTL::ResourceStorageModeShared);
+            memset(m_emptyBuffer->contents(), 0, 64 * 1024);
+        }
+        buffer = m_emptyBuffer;
+        offset = 0;
     }
 
     auto& boundBuffer = m_state.m_encoderState.m_buffers[shaderType][index];
@@ -3039,6 +3161,13 @@ void MetalRenderer::SetBuffer(MTL::RenderCommandEncoder* renderCommandEncoder, M
 
 void MetalRenderer::SetTexture(MTL::RenderCommandEncoder* renderCommandEncoder, MetalShaderType shaderType, MTL::Texture* texture, uint32 index)
 {
+    // the encoder-state arrays are MAX_MTL_TEXTURES wide, and bindings come from the shader's resource
+    // mapping - a bound the sibling SetSamplerState already has (its table is smaller still)
+    if (index >= MAX_MTL_TEXTURES)
+    {
+        cemuLog_logOnce(LogType::Force, "texture binding index {} exceeds the Metal texture table ({})", index, (uint32)MAX_MTL_TEXTURES);
+        return;
+    }
     auto& boundTexture = m_state.m_encoderState.m_textures[shaderType][index];
     if (texture == boundTexture)
         return;
@@ -3111,8 +3240,10 @@ MTL::CommandBuffer* MetalRenderer::GetCommandBuffer()
         auto pool = NS::AutoreleasePool::alloc()->init();
 	    MTL::CommandBuffer* mtlCommandBuffer = m_commandQueue->commandBuffer()->retain();
 		pool->release();
-		// frame identity so GPU traces read in game terms
-		mtlCommandBuffer->setLabel(ToNSString(fmt::format("cb frame {} submit {}", LatteGPUState.frameCounter, m_performanceMonitor.m_commandBuffers)));
+		// frame identity so GPU traces read in game terms. Only while a trace/capture is active: the
+		// format + string allocation would otherwise happen for every command buffer of every frame
+		if (IsTracingToolEnabled())
+			mtlCommandBuffer->setLabel(ToNSString(fmt::format("cb frame {} submit {}", LatteGPUState.frameCounter, m_performanceMonitor.m_commandBuffers)));
 		m_currentCommandBuffer = {mtlCommandBuffer};
 
 		// Wait for the previous command buffer
@@ -3211,31 +3342,30 @@ MTL::RenderCommandEncoder* MetalRenderer::GetRenderCommandEncoder(bool forceRecr
     auto pool = NS::AutoreleasePool::alloc()->init();
     auto renderCommandEncoder = commandBuffer->renderCommandEncoder(m_state.m_activeFBO.m_fbo->GetRenderPassDescriptor())->retain();
     pool->release();
-    // label with the pass identity so GPU traces show which game surface each pass targets
-    renderCommandEncoder->setLabel(ToNSString(fmt::format("pass fbo {:07x} draw mask {:x}",
-        GetFBOIdentityPhysAddress(m_state.m_activeFBO.m_fbo), (uint32)m_state.m_activeFBO.m_fbo->drawBuffersMask)));
+    // Label with the pass identity so a GPU trace shows which game surface each pass targets. Only
+    // while a trace/capture is active: this runs for every render pass of every frame, and the
+    // format + string allocation is pure overhead without one.
+    // The attachment count is printed rather than LatteCachedFBO::drawBuffersMask, which is never
+    // assigned anywhere (it reads 0), so the label said nothing about the pass
+    if (IsTracingToolEnabled())
+    {
+        uint32 colorAttachmentCount = 0;
+        for (uint8 i = 0; i < LATTE_NUM_COLOR_TARGET; i++)
+        {
+            if (m_state.m_activeFBO.m_fbo->colorBuffer[i].texture)
+                colorAttachmentCount++;
+        }
+        renderCommandEncoder->setLabel(ToNSString(fmt::format("pass fbo {:07x} rt {} depth {}",
+            GetFBOIdentityPhysAddress(m_state.m_activeFBO.m_fbo), colorAttachmentCount,
+            m_state.m_activeFBO.m_fbo->depthBuffer.texture ? 1 : 0)));
+    }
     m_commandEncoder = renderCommandEncoder;
     m_encoderType = MetalEncoderType::Render;
 
-    // this pass writes its attachments at their attached mip LEVEL only (the pass descriptor
-    // attaches a single level per attachment; the view's remaining mip range is not touched) -
-    // record just that level as render-written content (see BindStageResources' view clamping)
-    auto fboMtl = m_state.m_activeFBO.m_fbo;
-    for (uint8 i = 0; i < 8; i++)
-    {
-        if (fboMtl->colorBuffer[i].texture)
-        {
-            auto texMtl = static_cast<LatteTextureMtl*>(fboMtl->colorBuffer[i].texture->baseTexture);
-            texMtl->MarkRenderMipsWritten(fboMtl->colorBuffer[i].texture->firstMip, 1);
-            texMtl->MarkPassMipsWritten(fboMtl->colorBuffer[i].texture->firstMip, 1);
-        }
-    }
-    if (fboMtl->depthBuffer.texture)
-    {
-        auto texMtl = static_cast<LatteTextureMtl*>(fboMtl->depthBuffer.texture->baseTexture);
-        texMtl->MarkRenderMipsWritten(fboMtl->depthBuffer.texture->firstMip, 1);
-        texMtl->MarkPassMipsWritten(fboMtl->depthBuffer.texture->firstMip, 1);
-    }
+    // Attachment provenance is recorded by MarkPassAttachmentsWritten(), just before a draw is
+    // actually issued - not here. Opening a pass is not a write: the null-pipeline return below
+    // abandons the pass without drawing anything, and a pass that wrote nothing must not count as
+    // the game's own content (see the method's comment)
 
     // Update state
     m_state.m_lastUsedFBO = m_state.m_activeFBO;
@@ -3247,6 +3377,28 @@ MTL::RenderCommandEncoder* MetalRenderer::GetRenderCommandEncoder(bool forceRecr
     m_performanceMonitor.m_renderPasses++;
 
     return renderCommandEncoder;
+}
+
+// Records that the active pass wrote its attachments. This pass writes each attachment at the single
+// mip LEVEL the pass descriptor binds (the view's remaining mip range is not touched), so only that
+// level is recorded - see BindStageResources' view clamping and EnsureSampledMipContentValid
+void MetalRenderer::MarkPassAttachmentsWritten()
+{
+    auto fboMtl = m_state.m_activeFBO.m_fbo;
+    for (uint8 i = 0; i < LATTE_NUM_COLOR_TARGET; i++)
+    {
+        if (!fboMtl->colorBuffer[i].texture)
+            continue;
+        auto texMtl = static_cast<LatteTextureMtl*>(fboMtl->colorBuffer[i].texture->baseTexture);
+        texMtl->MarkRenderMipsWritten(fboMtl->colorBuffer[i].texture->firstMip, 1);
+        texMtl->MarkPassMipsWritten(fboMtl->colorBuffer[i].texture->firstMip, 1);
+    }
+    if (fboMtl->depthBuffer.texture)
+    {
+        auto texMtl = static_cast<LatteTextureMtl*>(fboMtl->depthBuffer.texture->baseTexture);
+        texMtl->MarkRenderMipsWritten(fboMtl->depthBuffer.texture->firstMip, 1);
+        texMtl->MarkPassMipsWritten(fboMtl->depthBuffer.texture->firstMip, 1);
+    }
 }
 
 MTL::ComputeCommandEncoder* MetalRenderer::GetComputeCommandEncoder()
@@ -3373,18 +3525,37 @@ void MetalRenderer::ProcessFinishedCommandBuffers()
 
 bool MetalRenderer::AcquireDrawable(bool mainWindow)
 {
-    auto& layer = GetLayer(mainWindow);
-    if (!layer.GetLayer())
-        return false;
-
-    const bool latteBufferUsesSRGB = mainWindow ? LatteGPUState.tvBufferUsesSRGB : LatteGPUState.drcBufferUsesSRGB;
-    if (latteBufferUsesSRGB != m_state.m_usesSRGB)
+    if (!mainWindow)
     {
-        layer.GetLayer()->setPixelFormat(latteBufferUsesSRGB ? MTL::PixelFormatBGRA8Unorm_sRGB : MTL::PixelFormatBGRA8Unorm);
-        m_state.m_usesSRGB = latteBufferUsesSRGB;
+        // single gate for pad-layer use: publish the frame, then check for a pending teardown (see
+        // StopUsingPadAndWait) - either the GUI waits for this frame or this stays off the layer
+        m_padFrameInProgress.store(true);
+        if (m_padLayerStopRequested.test())
+        {
+            EndPadFrame();
+            return false;
+        }
     }
 
-    return layer.AcquireDrawable();
+    auto& layer = GetLayer(mainWindow);
+    if (!layer.GetLayer())
+    {
+        if (!mainWindow)
+            EndPadFrame();
+        return false;
+    }
+
+    // each window follows its own scan buffer's sRGB flag: the TV and GamePad layers are presented
+    // independently, so they need independent formats
+    const bool latteBufferUsesSRGB = mainWindow ? LatteGPUState.tvBufferUsesSRGB : LatteGPUState.drcBufferUsesSRGB;
+    layer.SetUsesSRGB(latteBufferUsesSRGB);
+
+    const bool acquired = layer.AcquireDrawable();
+    // a failed acquire leaves no drawable on the layer (a held one makes AcquireDrawable succeed), so
+    // nothing of this frame is in flight on it: end the pad frame instead of keeping the GUI waiting
+    if (!acquired && !mainWindow)
+        EndPadFrame();
+    return acquired;
 }
 
 /*
@@ -3550,7 +3721,7 @@ void MetalRenderer::BindStageResources(MTL::RenderCommandEncoder* renderCommandE
 
     		sampler = m_samplerCache->GetSamplerState(LatteGPUState.contextNew, shader->shaderType, stageSamplerIndex, &samplerWords, shader->textureUsesDepthCompare[relative_textureUnit] != 0);
 
-			// LOD fields are in 1/64 units (see MetalSamplerCache and _getSamplerLodBiasMSL), and the
+			// LOD fields are in 1/64 units (see MetalSamplerCache, which sets them on the descriptor), and the
 			// sampler words here already include any texture overwrite. MIP_FILTER NONE means the
 			// sampler pins itself to level 0 (the sampler cache clamps lodMax to 0.25), so such a unit
 			// never reads an upper level at all
@@ -3558,6 +3729,27 @@ void MetalRenderer::BindStageResources(MTL::RenderCommandEncoder* renderCommandE
 			unitLodMax = (float)samplerWords.WORD1.get_MAX_LOD() / 64.0f;
 			unitLodBias = (float)samplerWords.WORD1.get_LOD_BIAS() / 64.0f;
 			unitMipFilter = (uint32)samplerWords.WORD0.get_MIP_FILTER();
+
+			// The bias belongs to the generated MSL text, not to the sampler (see MetalSamplerCache
+			// for why), so the two cases where the effective bias never reaches the shader are
+			// reported rather than silently sampling a different mip than Vulkan/OpenGL
+			if (shader->isCustomShader)
+			{
+				// a graphic pack shader - translated GLSL or authored MSL - is not emitted by the
+				// decompiler, so nothing folded the unit's bias into its sampling calls
+				if (unitLodBias != 0.0f)
+					MetalDiag_CountOncePer(MetalDiagEvent::SamplerLodBiasNotApplied, baseTexture->physAddress,
+						"{:016x} sampled by pack shader {} {:016x}_{:016x} unit {} with LOD bias {:+.2f}",
+						baseTexture->physAddress, StageLetter(shader->shaderType), shader->baseHash, shader->auxHash, relative_textureUnit, unitLodBias);
+			}
+			else if (baseTexture->overwriteInfo.hasLodBias || baseTexture->overwriteInfo.hasRelativeLodBias)
+			{
+				// a pack texture rule that overrides the bias patches the sampler words below, but
+				// the MSL was emitted from the raw register, so the override has no effect
+				MetalDiag_CountOncePer(MetalDiagEvent::SamplerLodBiasNotApplied, baseTexture->physAddress,
+					"{:016x} (unit {}): the pack's LOD bias override is not carried by the emitted MSL (effective bias {:+.2f})",
+					baseTexture->physAddress, relative_textureUnit, unitLodBias);
+			}
 		}
 		else
 		{
@@ -3568,15 +3760,15 @@ void MetalRenderer::BindStageResources(MTL::RenderCommandEncoder* renderCommandE
 		// get texture register word 0
 		uint32 word4 = LatteGPUState.contextRegister[texUnitRegIndex + 4];
 
-		// Clamp for resolution-overwritten effect surfaces: a view over a chain whose content is
-		// not the game's own is served mip 0 only - serving its copy-written upper levels instead
-		// brings back the MK8 dithering
+		// opt-in clamp (see EnsureSampledMipContentValid): a view whose reachable levels are not the
+		// game's own content is served mip 0 only
 		MTL::Texture* clampedView = nullptr; // cache-owned (see LatteTextureViewMtl::GetSwizzledViewWithMipCount) - do not release
 		{
 			auto texMtl = static_cast<LatteTextureMtl*>(baseTexture);
 			const uint32 passMask = texMtl->GetPassWrittenMipMask();
 			const uint32 renderMask = texMtl->GetRenderWrittenMipMask();
-			const bool clampClass = !baseTexture->isDepth && !baseTexture->Is3DTexture() && baseTexture->mipLevels > 1
+			const bool clampClass = GetConfig().mtl_sampled_mip_workarounds.GetValue() // off by default, see EnsureSampledMipContentValid
+				&& !baseTexture->isDepth && !baseTexture->Is3DTexture() && baseTexture->mipLevels > 1
 				&& textureView->numMip > 1 && textureView->firstMip < 32
 				&& (textureView->firstMip + textureView->numMip) <= 32
 				&& GetMtlPixelFormatInfo(baseTexture->format, false).dataType == MetalDataType::FLOAT;
@@ -3586,21 +3778,10 @@ void MetalRenderer::BindStageResources(MTL::RenderCommandEncoder* renderCommandE
 				// content arrives via LatteTextureLoader) must keep their full mip chains, and
 				// surfaces that never received GPU content have nothing to fall back to anyway
 				const bool gpuWrittenMip0 = (renderMask & 1u) != 0;
-				// the discriminator: is the content of the levels this view samples this chain's
-				// own? The written masks cannot tell - a faithfully preserved chain and a
-				// re-cropped one both look copy-written - so the verdict comes from the copy
-				// provenance recorded in the copy paths (LatteTextureMtl::MarkCopyMipsWritten)
-				// Only the game's own upper mip levels may be served: the backend's regenerated
-				// downsample is no better than clamping to mip 0, because both replace the levels the
-				// game's own passes wrote (serving them loses DoF and bloom)
-				// Only the levels this unit can actually resolve have to be trustworthy. The guest
-				// sampler's LOD range (MIN_LOD/MAX_LOD, already carried into the Metal sampler as
-				// its lod clamps) bounds which levels any tap in this draw can reach, and LOD is in
-				// view space - relative to the view's base level. Testing the whole declared range
-				// instead refuses a draw that reads only mip 1 because a level it cannot reach is
-				// partly written. Measured on a DoF/bloom chain: draws sampling at lod 1.00..1.00
-				// were clamped to mip 0 for the whole session because mip 3 was a partial copy.
-				// A unit with no sampler keeps the 0.0 defaults and is judged on its base level only
+				// the verdict comes from the copy provenance (LatteTextureMtl::MarkCopyMipsWritten): the
+				// written masks can't tell a preserved chain from a re-cropped one. Only the levels the
+				// unit's LOD range (view-relative MIN_LOD/MAX_LOD) can reach must be trustworthy; a unit
+				// with no sampler keeps the 0.0 defaults and is judged on its base level only
 				const uint32 lodFirstOffset = (uint32)std::max(0.0f, std::floor(unitLodMin));
 				const uint32 lodLastOffset = (uint32)std::max(0.0f, std::ceil(unitLodMax));
 				const uint32 viewEndMip = textureView->firstMip + textureView->numMip;
@@ -3611,10 +3792,9 @@ void MetalRenderer::BindStageResources(MTL::RenderCommandEncoder* renderCommandE
 				if (rangeTrustworthy)
 				{
 					// served exactly as the game asked for it. The per-texture latch lives inside
-					// CountOncePer: the decision is per texture, but this is reached once per draw
-					// that samples it
-					if (rangeTrustworthy)
-						MetalDiag_CountFirstSighting(MetalDiagEvent::SampledMipChainTrusted, texMtl->physAddress,
+					// CountFirstSighting: the decision is per texture, but this is reached once per
+					// draw that samples it
+					MetalDiag_CountFirstSighting(MetalDiagEvent::SampledMipChainTrusted, texMtl->physAddress,
 							"{:016x} view mips {}+{} ({} mips total, format {:04x}, guest mips {}, passMask {:x}, renderMask {:x}, matchedCopyMask {:x}, resampledCopyMask {:x}, partialCopyMask {:x}, lastCopy {}, sampled by {} {:016x}_{:016x} unit {} (lod {:.2f}..{:.2f} bias {:+.2f} mipfilter {}))",
 							texMtl->physAddress, textureView->firstMip, textureView->numMip, texMtl->mipLevels, (uint32)texMtl->format,
 							baseTexture->mipLevels, passMask, renderMask,
@@ -3641,7 +3821,7 @@ void MetalRenderer::BindStageResources(MTL::RenderCommandEncoder* renderCommandE
 		// attachment feedback loop: this draw samples a texture that is an attachment of the active
 		// render pass. PrepareFeedbackLoopShadowCopies ended the previous pass and copied the
 		// attachment contents into shadow textures before this pass began - bind the shadow copy
-		// instead (Metal cannot read a texture attached to the current encoder; Vulkan serves these
+		// instead (Metal cannot read an attached mip/slice in the current encoder; Vulkan serves these
 		// reads via VK_EXT_attachment_feedback_loop_layout)
 		auto shadowItr = m_feedbackShadowTextures.find(baseTexture);
 		if (shadowItr != m_feedbackShadowTextures.end())
@@ -3694,8 +3874,42 @@ void MetalRenderer::BindStageResources(MTL::RenderCommandEncoder* renderCommandE
 		}
 	}
 
+	// render target sizes for RESINFO on framebuffer-fetch units (fetchTargetSizes in the MSL header):
+	// the fetch classification guarantees the unit's view is the attachment view, so this is the size
+	// textureSize() returns on Vulkan
+	if (shader->shaderType == LatteConst::ShaderType::Pixel && m_supportsFramebufferFetch && m_state.m_activeFBO.m_fbo)
+	{
+		bool usesFetch = false;
+		for (sint32 i = 0; i < shader->textureUnitListCount; i++)
+		{
+			if (shader->textureRenderTargetIndex[shader->textureUnitList[i]] != 255)
+			{
+				usesFetch = true;
+				break;
+			}
+		}
+		if (usesFetch)
+		{
+			uint32 sizes[LATTE_NUM_COLOR_TARGET * 2] = {};
+			for (uint8 i = 0; i < LATTE_NUM_COLOR_TARGET; i++)
+			{
+				LatteTextureView* view = m_state.m_activeFBO.m_fbo->colorBuffer[i].texture;
+				if (!view)
+					continue;
+				MTL::Texture* mtlTexture = static_cast<LatteTextureMtl*>(view->baseTexture)->GetTexture();
+				sizes[i * 2 + 0] = std::max<uint32>(1, (uint32)mtlTexture->width() >> view->firstMip);
+				sizes[i * 2 + 1] = std::max<uint32>(1, (uint32)mtlTexture->height() >> view->firstMip);
+			}
+			renderCommandEncoder->setFragmentBytes(sizes, sizeof(sizes), GET_HELPER_BUFFER_BINDING(0));
+			m_state.m_encoderState.m_buffers[METAL_SHADER_TYPE_FRAGMENT][GET_HELPER_BUFFER_BINDING(0)] = {nullptr};
+		}
+	}
+
 	// Support buffer
-	auto GET_UNIFORM_DATA_PTR = [&](size_t index) { return supportBufferData + (index / 4); };
+	// staging for the support buffer: the file-scope array covers every realistic layout, a larger one
+	// (uniformRangeSize is not capped) switches to a heap buffer below instead of overflowing it
+	float* uniformData = supportBufferData;
+	auto GET_UNIFORM_DATA_PTR = [&](size_t index) { return uniformData + (index / 4); };
 
 	sint32 shaderAluConst;
 	sint32 shaderUniformRegisterOffset;
@@ -3720,6 +3934,12 @@ void MetalRenderer::BindStageResources(MTL::RenderCommandEncoder* renderCommandE
 
 	if (shader->resourceMapping.uniformVarsBufferBindingPoint >= 0)
 	{
+		if (shader->uniform.uniformRangeSize > sizeof(supportBufferData))
+		{
+			static std::vector<float> s_oversizedSupportBuffer; // BindStageResources only runs on the render thread
+			s_oversizedSupportBuffer.resize((shader->uniform.uniformRangeSize + 3) / 4);
+			uniformData = s_oversizedSupportBuffer.data();
+		}
 		if (shader->uniform.list_ufTexRescale.empty() == false)
 		{
 			for (auto& entry : shader->uniform.list_ufTexRescale)
@@ -3765,7 +3985,7 @@ void MetalRenderer::BindStageResources(MTL::RenderCommandEncoder* renderCommandE
 		}
 		if (shader->uniform.loc_verticesPerInstance >= 0)
 		{
-			*(int*)(supportBufferData + ((size_t)shader->uniform.loc_verticesPerInstance / 4)) = m_state.m_streamoutState.verticesPerInstance;
+			*(int*)GET_UNIFORM_DATA_PTR(shader->uniform.loc_verticesPerInstance) = m_state.m_streamoutState.verticesPerInstance;
 			for (sint32 b = 0; b < LATTE_NUM_STREAMOUT_BUFFER; b++)
 			{
 				if (shader->uniform.loc_streamoutBufferBase[b] >= 0)
@@ -3778,7 +3998,7 @@ void MetalRenderer::BindStageResources(MTL::RenderCommandEncoder* renderCommandE
 		size_t size = shader->uniform.uniformRangeSize;
 		auto& bufferAllocator = m_memoryManager->GetStagingAllocator();
 		auto allocation = bufferAllocator.AllocateBufferMemory(size, 1);
-		memcpy(allocation.memPtr, supportBufferData, size);
+		memcpy(allocation.memPtr, uniformData, size);
 		bufferAllocator.FlushReservation(allocation);
 
 		SetBuffer(renderCommandEncoder, mtlShaderType, allocation.mtlBuffer, allocation.bufferOffset, shader->resourceMapping.uniformVarsBufferBindingPoint);
@@ -3884,55 +4104,50 @@ static std::string s_gputracePath;
 
 void MetalRenderer::StartCapture()
 {
+    // Always writes a .gputrace document, never CaptureDestinationDeveloperTools: with that destination
+    // the stopCapture() one frame later blocks forever while Xcode's debugger suspends the task. Xcode's
+    // own Capture GPU Frame button drives start and stop itself and never comes through here
+    std::string captureDir = GetConfig().gpu_capture_dir.GetValue();
+    if (captureDir.empty())
+    {
+        cemuLog_log(LogType::Force, "No GPU capture directory configured (Debug -> GPU capture directory), cannot write a capture. To capture into Xcode's frame debugger use its Capture GPU Frame button instead");
+        return;
+    }
+
     auto captureManager = MTL::CaptureManager::sharedCaptureManager();
-    auto desc = MTL::CaptureDescriptor::alloc()->init();
+    NS_STACK_SCOPED MTL::CaptureDescriptor* desc = MTL::CaptureDescriptor::alloc()->init();
     desc->setCaptureObject(m_device);
 
-    std::string captureDir = GetConfig().gpu_capture_dir.GetValue();
-
-    // Check if a debugger with support for GPU capture is attached
-    if (captureManager->supportsDestination(MTL::CaptureDestinationDeveloperTools))
+    // only a warning: supportsDestination can return false when the capture works, so startCapture
+    // below gets the final say (its error is logged)
+    if (!captureManager->supportsDestination(MTL::CaptureDestinationGPUTraceDocument))
     {
-        desc->setDestination(MTL::CaptureDestinationDeveloperTools);
+        cemuLog_log(LogType::Force, "GPU trace document destination reported unavailable; attempting the capture anyway");
     }
-    else
-    {
-        if (captureDir.empty())
-        {
-            cemuLog_log(LogType::Force, "No GPU capture directory specified, cannot do a GPU capture");
-            return;
-        }
 
-        // Check if the GPU trace document destination is available. Only a warning:
-        // supportsDestination has been observed returning false on this OS even when the
-        // capture works, so startCapture below gets the final say (its error is logged)
-        if (!captureManager->supportsDestination(MTL::CaptureDestinationGPUTraceDocument))
-        {
-            cemuLog_log(LogType::Force, "GPU trace document destination reported unavailable; attempting the capture anyway");
-        }
+    // Get current date and time as a string
+    auto now = std::chrono::system_clock::now();
+    std::time_t now_time = std::chrono::system_clock::to_time_t(now);
+    std::ostringstream oss;
+    oss << std::put_time(std::localtime(&now_time), "%Y-%m-%d_%H-%M-%S");
+    std::string now_str = oss.str();
 
-        // Get current date and time as a string
-        auto now = std::chrono::system_clock::now();
-        std::time_t now_time = std::chrono::system_clock::to_time_t(now);
-        std::ostringstream oss;
-        oss << std::put_time(std::localtime(&now_time), "%Y-%m-%d_%H-%M-%S");
-        std::string now_str = oss.str();
-
-        std::string capturePath = fmt::format("{}/cemu_{}.gputrace", captureDir, now_str);
-        desc->setDestination(MTL::CaptureDestinationGPUTraceDocument);
-        desc->setOutputURL(ToNSURL(capturePath));
-        cemuLog_log(LogType::Force, "GPU capture: writing {}", capturePath);
-        s_gputracePath = capturePath;
-    }
+    std::string capturePath = fmt::format("{}/cemu_{}.gputrace", captureDir, now_str);
+    desc->setDestination(MTL::CaptureDestinationGPUTraceDocument);
+    desc->setOutputURL(ToNSURL(capturePath));
+    cemuLog_log(LogType::Force, "GPU capture: writing {}", capturePath);
+    s_gputracePath = capturePath;
 
     NS::Error* error = nullptr;
-    captureManager->startCapture(desc, &error);
-    if (error)
+    const bool started = captureManager->startCapture(desc, &error);
+    if (!started || error)
     {
-        cemuLog_log(LogType::Force, "Failed to start GPU capture: {}", error->localizedDescription()->utf8String());
-        // no capture will run: cancel the done-marker so automation doesn't wait on a
-        // trace file that will never exist
+        cemuLog_log(LogType::Force, "Failed to start GPU capture: {}",
+            error ? error->localizedDescription()->utf8String() : "startCapture refused");
+        // no capture will run: don't record one as running - m_capturing drives the stopCapture() call
+        // at the end of the next frame, which must not run for a capture that never started
         s_gputracePath.clear();
+        return;
     }
 
     m_capturing = true;

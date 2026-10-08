@@ -27,58 +27,57 @@ namespace LatteDecompiler
 		const std::vector<SupportBufferFieldLayout> fields = ComputeSupportBufferLayout(decompilerContext, vulkanStyle, uniformOffsets);
 		for (const auto& field : fields)
 		{
+			// the declared type comes from the shared table, so this asserts the size of the
+			// declaration this emitter is about to produce against the byte size the layout recorded
+			const SupportBufferFieldType type = GetSupportBufferFieldType(field.kind, vulkanStyle);
+			cemu_assert_debug(GetSupportBufferFieldTypeSize(field, type) == field.size);
+			const std::string typeText = GetSupportBufferFieldTypeGLSL(type);
 			switch (field.kind)
 			{
 			case SupportBufferFieldLayout::Kind::RemappedUniforms:
 				// uniform registers or buffers are accessed statically with predictable offsets
 				// this allows us to remap the used entries into a more compact array
 				if (shaderType == LatteConst::ShaderType::Vertex)
-					shaderSrc->addFmt("uniform ivec4 uf_remappedVS[{}];" _CRLF, field.arrayCount);
+					shaderSrc->addFmt("uniform {} uf_remappedVS[{}];" _CRLF, typeText, field.arrayCount);
 				else if (shaderType == LatteConst::ShaderType::Pixel)
-					shaderSrc->addFmt("uniform ivec4 uf_remappedPS[{}];" _CRLF, field.arrayCount);
+					shaderSrc->addFmt("uniform {} uf_remappedPS[{}];" _CRLF, typeText, field.arrayCount);
 				else if (shaderType == LatteConst::ShaderType::Geometry)
-					shaderSrc->addFmt("uniform ivec4 uf_remappedGS[{}];" _CRLF, field.arrayCount);
+					shaderSrc->addFmt("uniform {} uf_remappedGS[{}];" _CRLF, typeText, field.arrayCount);
 				else
 					debugBreakpoint();
 				break;
 			case SupportBufferFieldLayout::Kind::UniformRegisterFile:
 				// full or partial uniform register file has to be present
 				if (shaderType == LatteConst::ShaderType::Vertex)
-					shaderSrc->addFmt("uniform ivec4 uf_uniformRegisterVS[{}];" _CRLF, field.arrayCount);
+					shaderSrc->addFmt("uniform {} uf_uniformRegisterVS[{}];" _CRLF, typeText, field.arrayCount);
 				else if (shaderType == LatteConst::ShaderType::Pixel)
-					shaderSrc->addFmt("uniform ivec4 uf_uniformRegisterPS[{}];" _CRLF, field.arrayCount);
+					shaderSrc->addFmt("uniform {} uf_uniformRegisterPS[{}];" _CRLF, typeText, field.arrayCount);
 				else if (shaderType == LatteConst::ShaderType::Geometry)
-					shaderSrc->addFmt("uniform ivec4 uf_uniformRegisterGS[{}];" _CRLF, field.arrayCount);
+					shaderSrc->addFmt("uniform {} uf_uniformRegisterGS[{}];" _CRLF, typeText, field.arrayCount);
 				break;
 			case SupportBufferFieldLayout::Kind::WindowSpaceToClipSpaceTransform:
-				shaderSrc->add("uniform vec2 uf_windowSpaceToClipSpaceTransform;" _CRLF);
+				shaderSrc->addFmt("uniform {} uf_windowSpaceToClipSpaceTransform;" _CRLF, typeText);
 				break;
 			case SupportBufferFieldLayout::Kind::AlphaTestRef:
-				shaderSrc->add("uniform float uf_alphaTestRef;" _CRLF);
+				shaderSrc->addFmt("uniform {} uf_alphaTestRef;" _CRLF, typeText);
 				break;
 			case SupportBufferFieldLayout::Kind::PointSize:
-				shaderSrc->add("uniform float uf_pointSize;" _CRLF);
+				shaderSrc->addFmt("uniform {} uf_pointSize;" _CRLF, typeText);
 				break;
 			case SupportBufferFieldLayout::Kind::FragCoordScale:
-				if (vulkanStyle)
-					shaderSrc->add("uniform vec4 uf_fragCoordScale;" _CRLF); // stores the origin in zw
-				else
-					shaderSrc->add("uniform vec2 uf_fragCoordScale;" _CRLF);
+				shaderSrc->addFmt("uniform {} uf_fragCoordScale;" _CRLF, typeText); // the Vulkan profile stores the origin in zw
 				break;
 			case SupportBufferFieldLayout::Kind::FragCoordScaleCompatPadding:
-				if (vulkanStyle)
-					shaderSrc->add("uniform vec4 uf_fragCoordScaleCompatPadding;" _CRLF);
-				else
-					shaderSrc->add("uniform vec2 uf_fragCoordScaleCompatPadding;" _CRLF);
+				shaderSrc->addFmt("uniform {} uf_fragCoordScaleCompatPadding;" _CRLF, typeText);
 				break;
 			case SupportBufferFieldLayout::Kind::TexScale:
-				shaderSrc->addFmt("uniform vec2 uf_tex{}Scale;" _CRLF, field.texUnit);
+				shaderSrc->addFmt("uniform {} uf_tex{}Scale;" _CRLF, typeText, field.texUnit);
 				break;
 			case SupportBufferFieldLayout::Kind::VerticesPerInstance:
-				shaderSrc->add("uniform int uf_verticesPerInstance;" _CRLF);
+				shaderSrc->addFmt("uniform {} uf_verticesPerInstance;" _CRLF, typeText);
 				break;
 			case SupportBufferFieldLayout::Kind::StreamoutBufferBase:
-				shaderSrc->addFmt("uniform int uf_streamoutBufferBase{};" _CRLF, field.streamoutIndex);
+				shaderSrc->addFmt("uniform {} uf_streamoutBufferBase{};" _CRLF, typeText, field.streamoutIndex);
 				break;
 			}
 		}

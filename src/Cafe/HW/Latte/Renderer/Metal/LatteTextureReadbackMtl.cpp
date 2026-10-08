@@ -78,11 +78,25 @@ bool LatteTextureReadbackInfoMtl::IsFinished()
     //if (m_mtlr->GetCurrentCommandBuffer() == m_commandBuffer)
     //    m_mtlr->CommitCommandBuffer();
 
+    if (!m_commandBuffer)
+        return false;
+    // An errored command buffer reports as completed (CommandBufferCompleted in MetalCommon.h counts
+    // CommandBufferStatusError), which would let the consumer read the staging buffer's previous
+    // contents as this transfer's image. Settle the failure here instead: report it once and clear
+    // the image, so a failed transfer yields zeros rather than another readback's data
+    if (!m_transferFailed && m_commandBuffer->status() == MTL::CommandBufferStatusError)
+    {
+        m_transferFailed = true;
+        cemuLog_logOnce(LogType::Force, "texture readback: the Metal command buffer failed, the readback data is cleared rather than left stale");
+        memset((uint8*)m_mtlr->GetTextureReadbackBuffer()->contents() + m_bufferOffset, 0, m_image_size);
+    }
     return CommandBufferCompleted(m_commandBuffer);
 }
 
 void LatteTextureReadbackInfoMtl::ForceFinish()
 {
+    if (!m_commandBuffer)
+        return; // StartTransfer was never called
     m_commandBuffer->waitUntilCompleted();
 }
 

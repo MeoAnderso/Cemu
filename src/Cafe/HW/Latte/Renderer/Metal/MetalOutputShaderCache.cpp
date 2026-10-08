@@ -12,6 +12,13 @@ MetalOutputShaderCache::~MetalOutputShaderCache()
 
 MTL::RenderPipelineState* MetalOutputShaderCache::GetPipeline(RendererOutputShader* shader, uint8 shaderIndex, bool usesSRGB)
 {
+    // shaderIndex stays 255 when DrawBackbufferQuad does not recognise the shader, and it is
+    // otherwise unchecked - either would index m_cache out of bounds
+    if (shaderIndex >= METAL_SHADER_TYPE_COUNT)
+    {
+        cemuLog_logOnce(LogType::Force, "unknown output shader index {}", (uint32)shaderIndex);
+        return nullptr;
+    }
     uint8 cacheIndex = (usesSRGB ? METAL_SHADER_TYPE_COUNT : 0) + shaderIndex;
     auto& renderPipelineState = m_cache[cacheIndex];
     if (renderPipelineState)

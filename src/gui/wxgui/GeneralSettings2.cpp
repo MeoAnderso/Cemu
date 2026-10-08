@@ -413,6 +413,10 @@ wxPanel* GeneralSettings2::AddGraphicsPage(wxNotebook* notebook)
 		m_force_mesh_shaders = new wxCheckBox(box, wxID_ANY, _("Force mesh shaders"));
 		m_force_mesh_shaders->SetToolTip(_("Force mesh shaders on all GPUs that support them. Mesh shaders are disabled by default on Intel GPUs due to potential stability issues.\nMetal only"));
 		graphic_misc_row->Add(m_force_mesh_shaders, 0, wxALL, 5);
+
+		m_mtl_sampled_mip_workarounds = new wxCheckBox(box, wxID_ANY, _("Mip chain workarounds"));
+		m_mtl_sampled_mip_workarounds->SetToolTip(_("Clamp a sampled mip chain to its base level, or regenerate its upper levels from base level, when the game never wrote them.\nThis makes Metal serve mip content the game did not write; Vulkan does neither, so filtered effects (DoF, bloom) can differ.\nMetal only\n\nRecommended: off"));
+		graphic_misc_row->Add(m_mtl_sampled_mip_workarounds, 0, wxALL, 5);
 #endif
 
 		box_sizer->Add(graphic_misc_row, 1, wxEXPAND, 5);
@@ -1266,6 +1270,7 @@ void GeneralSettings2::StoreConfig()
 	config.gx2drawdone_sync = m_gx2drawdone_sync->IsChecked();
 #ifdef ENABLE_METAL
 	config.force_mesh_shaders = m_force_mesh_shaders->IsChecked();
+	config.mtl_sampled_mip_workarounds = m_mtl_sampled_mip_workarounds->IsChecked();
 #endif
 	config.async_compile = m_async_compile->IsChecked();
 
@@ -1764,6 +1769,7 @@ void GeneralSettings2::HandleGraphicsApiSelection()
 		m_async_compile->Disable();
 #ifdef ENABLE_METAL
 		m_force_mesh_shaders->Disable();
+		m_mtl_sampled_mip_workarounds->Disable();
 #endif
 		break;
 	}
@@ -1776,6 +1782,7 @@ void GeneralSettings2::HandleGraphicsApiSelection()
 		m_async_compile->Enable();
 #ifdef ENABLE_METAL
 		m_force_mesh_shaders->Disable();
+		m_mtl_sampled_mip_workarounds->Disable();
 #endif
 
 		m_vsync->AppendString(_("Off"));
@@ -1827,6 +1834,7 @@ void GeneralSettings2::HandleGraphicsApiSelection()
 		m_gx2drawdone_sync->Disable();
 		m_async_compile->Enable();
 		m_force_mesh_shaders->Enable();
+		m_mtl_sampled_mip_workarounds->Enable();
 
 		m_vsync->AppendString(_("Off"));
 		m_vsync->AppendString(_("On"));
@@ -1943,6 +1951,7 @@ void GeneralSettings2::ApplyConfig()
 	m_gx2drawdone_sync->SetValue(config.gx2drawdone_sync);
 #ifdef ENABLE_METAL
 	m_force_mesh_shaders->SetValue(config.force_mesh_shaders);
+	m_mtl_sampled_mip_workarounds->SetValue(config.mtl_sampled_mip_workarounds);
 #endif
 	m_upscale_filter->SetSelection(config.upscale_filter);
 	m_downscale_filter->SetSelection(config.downscale_filter);

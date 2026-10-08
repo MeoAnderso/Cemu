@@ -74,7 +74,7 @@ private:
 
 	wxCheckBox *m_async_compile, *m_gx2drawdone_sync;
 #ifdef ENABLE_METAL
-	wxCheckBox *m_force_mesh_shaders;
+	wxCheckBox *m_force_mesh_shaders, *m_mtl_sampled_mip_workarounds;
 #endif
 	wxRadioBox* m_upscale_filter, *m_downscale_filter, *m_fullscreen_scaling;
 	wxChoice* m_overlay_position, *m_notification_position, *m_overlay_scale, *m_notification_scale;

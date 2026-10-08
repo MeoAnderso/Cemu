@@ -221,17 +221,25 @@ bool GameProfile::Load(uint64_t title_id)
 		else if (boost::iequals(iniParser.GetCurrentSectionName(), "Graphics"))
 		{
 			gameProfileIntegerOption_t graphicsApi;
-			// accept the full GraphicAPI enum range (0=OpenGL, 1=Vulkan, 2=Metal). The range
-			// still ended at 1 after Metal was added, so the backend value the emulator writes
-			// back on exit (2) was rejected as out of range on the next load and silently
-			// fell back to the build default
-			gameProfile_loadIntegerOption(&iniParser, "graphics_api", &graphicsApi, -1, 0, (int)GraphicAPI::COUNT - 1);
+			// the range only caps the top end: values above the highest backend compiled into this
+			// build (Metal = 2 when present) are rejected; a lower backend that isn't compiled in is
+			// still accepted
+			int maxGraphicsApi = 0;
+#ifdef ENABLE_OPENGL
+			maxGraphicsApi = std::max(maxGraphicsApi, (int)GraphicAPI::kOpenGL);
+#endif
+#ifdef ENABLE_VULKAN
+			maxGraphicsApi = std::max(maxGraphicsApi, (int)GraphicAPI::kVulkan);
+#endif
+#ifdef ENABLE_METAL
+			maxGraphicsApi = std::max(maxGraphicsApi, (int)GraphicAPI::kMetal);
+#endif
+			gameProfile_loadIntegerOption(&iniParser, "graphics_api", &graphicsApi, -1, 0, maxGraphicsApi);
 			if (graphicsApi.value != -1)
 				m_graphics_api = (GraphicAPI)graphicsApi.value;
 
 			gameProfile_loadEnumOption(iniParser, "accurateShaderMul", m_accurateShaderMul);
 #ifdef ENABLE_METAL
-			gameProfile_loadBooleanOption2(iniParser, "shaderFastMath", m_shaderFastMath);
 			gameProfile_loadEnumOption(iniParser, "metalBufferCacheMode2", m_metalBufferCacheMode);
 			gameProfile_loadEnumOption(iniParser, "positionInvariance2", m_positionInvariance);
 #endif
@@ -316,7 +324,6 @@ void GameProfile::Save(uint64_t title_id)
 	fs->writeLine("[Graphics]");
 	WRITE_ENTRY(accurateShaderMul);
 #ifdef ENABLE_METAL
-	WRITE_ENTRY(shaderFastMath);
 	WRITE_ENTRY_NUMBERED(metalBufferCacheMode, 2);
 	WRITE_ENTRY_NUMBERED(positionInvariance, 2);
 #endif
@@ -351,7 +358,6 @@ void GameProfile::ResetOptional()
 	// graphic settings
 	m_accurateShaderMul = AccurateShaderMulOption::True;
 #ifdef ENABLE_METAL
-	m_shaderFastMath = true;
 	m_metalBufferCacheMode = MetalBufferCacheMode::Auto;
 	m_positionInvariance = PositionInvariance::Auto;
 #endif
@@ -376,7 +382,6 @@ void GameProfile::Reset()
 	// graphic settings
 	m_accurateShaderMul = AccurateShaderMulOption::True;
 #ifdef ENABLE_METAL
-	m_shaderFastMath = true;
 	m_metalBufferCacheMode = MetalBufferCacheMode::Auto;
 	m_positionInvariance = PositionInvariance::Auto;
 #endif

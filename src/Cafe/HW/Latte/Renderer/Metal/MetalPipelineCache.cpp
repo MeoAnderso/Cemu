@@ -2,6 +2,8 @@
 #include "Cafe/HW/Latte/Renderer/Metal/MetalRenderer.h"
 #include "Cafe/HW/Latte/Renderer/Metal/LatteToMtl.h"
 #include "Cafe/HW/Latte/Renderer/Metal/MetalPipelineCompiler.h"
+#include "Cafe/HW/Latte/Renderer/Metal/MetalDiagnostics.h"
+#include "Cafe/HW/Latte/Renderer/Metal/MetalCppCompat.h"
 
 #include "Cafe/HW/Latte/Core/FetchShader.h"
 #include "Cafe/HW/Latte/ISA/RegDefines.h"
@@ -20,14 +22,33 @@
 static bool g_compilePipelineThreadInit{false};
 
 // Guards the lifetime of s_cache. It is opened on the loader thread (BeginLoading), read on the
-// loader thread, and used by the detached cache-writer thread (WorkerThread), while Close() runs on
-// the emulation thread at title exit. Without this, Close() could delete the FileCache between the
-// writer's null check and its AddFileAsync call (a use-after-free), and the same window exists for
-// the loader. Every check-then-use pair must therefore sit inside one critical section
+// loader thread, and used by the cache-writer thread (WorkerThread, joined in StopStoreThread), while
+// Close() runs on the emulation thread at title exit. Without this, Close() could delete the FileCache
+// between the writer's null check and its AddFileAsync call (a use-after-free), and the same window
+// exists for the loader. Every check-then-use pair must therefore sit inside one critical section
 static std::mutex s_fileCacheMutex;
+// How many times a driver-side pipeline failure is retried before the entry is treated as permanent.
+// High enough to ride out a transient hiccup, low enough that a deterministic failure cannot turn into
+// a per-draw compile + log storm
+static constexpr uint32 kMaxTransientPipelineCompileAttempts = 8;
+// Version of the Metal pipeline cache file's record format, added to the shared pipeline cache version
+// (LatteShaderCache_getPipelineCacheExtraVersion, which Vulkan's file uses too). Bump it when
+// SerializePipeline/DeserializePipeline change: FileCache then recreates only the Metal file
+static constexpr uint32 kMetalPipelineCacheFormatVersion = 1;
+
+// Session totals maintained by MetalPipelineCompiler: every successful pipeline creation on any path
+// (the OSD's own counters exclude the async pool and the shader-cache replay, where most happen)
+extern std::atomic_uint64_t g_mtlPipelineCreationTimeNs;
+extern std::atomic_uint32_t g_mtlPipelineCreationCount;
+
 static std::mutex g_compilePipelineMutex;
 static std::condition_variable g_compilePipelineCondVar;
 static std::queue<MetalPipelineCompiler*> g_compilePipelineRequests;
+// the pool is process-global but its work targets PipelineObjects owned by one MetalPipelineCache, so the
+// cache that started it has to stop it (see stopCompileThreads) - the threads are joinable, not detached,
+// or a compile in flight at title exit would write into the freed PipelineObject
+static std::vector<std::thread> g_compilePipelineThreads;
+static bool g_compilePipelineStop{ false };
 
 static void compileThreadFunc(sint32 threadIndex)
 {
@@ -40,8 +61,19 @@ static void compileThreadFunc(sint32 threadIndex)
 	while (true)
 	{
 		std::unique_lock lock(g_compilePipelineMutex);
-		while (g_compilePipelineRequests.empty())
-			g_compilePipelineCondVar.wait(lock);
+		g_compilePipelineCondVar.wait(lock, [] { return g_compilePipelineStop || !g_compilePipelineRequests.empty(); });
+
+		if (g_compilePipelineStop)
+		{
+			// the owning cache is being destroyed. Its PipelineObjects are about to be freed, so the
+			// queued requests must not be compiled - free them and exit
+			while (!g_compilePipelineRequests.empty())
+			{
+				delete g_compilePipelineRequests.front();
+				g_compilePipelineRequests.pop();
+			}
+			return;
+		}
 
 		MetalPipelineCompiler* request = g_compilePipelineRequests.front();
 
@@ -52,6 +84,24 @@ static void compileThreadFunc(sint32 threadIndex)
 		request->Compile(true, false, true);
 		delete request;
 	}
+}
+
+// Stops the pool and waits for in-flight compiles. Must run before the pipeline cache map is torn down -
+// it clears |g_compilePipelineStop| so a later title can start a fresh pool
+static void stopCompileThreads()
+{
+	{
+		std::unique_lock lock(g_compilePipelineMutex);
+		g_compilePipelineStop = true;
+	}
+	g_compilePipelineCondVar.notify_all();
+	for (auto& thread : g_compilePipelineThreads)
+	{
+		if (thread.joinable())
+			thread.join();
+	}
+	g_compilePipelineThreads.clear();
+	g_compilePipelineThreadInit = false;
 }
 
 static void initCompileThread()
@@ -66,11 +116,10 @@ static void initCompileThread()
 
 	numCompileThreads = std::min(numCompileThreads, 8u); // cap at 8
 
+	g_compilePipelineStop = false;
+
 	for (uint32 i = 0; i < numCompileThreads; i++)
-	{
-		std::thread compileThread(compileThreadFunc, i);
-		compileThread.detach();
-	}
+		g_compilePipelineThreads.emplace_back(compileThreadFunc, i);
 }
 
 static void queuePipeline(MetalPipelineCompiler* v)
@@ -121,8 +170,24 @@ MetalPipelineCache::~MetalPipelineCache()
     // anything below runs
     StopStoreThread();
 
+    // the compile threads (the async pool and the cache-loader threads) write into the PipelineObjects
+    // below, so they have to be stopped and drained before the map is torn down. Normally
+    // MetalRenderer::Shutdown already did this, and the second call does nothing
+    StopCompilation();
+
     // drop whatever it had not picked up yet - those jobs are heap objects owned by nobody else
     DiscardPendingJobs();
+
+    if (m_binaryArchiveWrite)
+    {
+        m_binaryArchiveWrite->release();
+        m_binaryArchiveWrite = nullptr;
+    }
+    if (m_binaryArchiveRead)
+    {
+        m_binaryArchiveRead->release();
+        m_binaryArchiveRead = nullptr;
+    }
 
     m_pipelineCacheLock.lock();
     for (auto& [key, pipelineObj] : m_pipelineCache)
@@ -145,10 +210,23 @@ PipelineObject* MetalPipelineCache::GetRenderPipelineState(const LatteFetchShade
     if (pipelineObj && pipelineObj->compileFailed && !pipelineObj->permanentFailure)
     {
         // evict transiently failed compilations so this call retries instead of skipping draws
-        // forever (permanent failures stay cached: retrying them would fail identically per draw)
-        m_pipelineCache.erase(it);
-        delete pipelineObj;
-        pipelineObj = nullptr;
+        // forever (permanent failures stay cached: retrying them would fail identically per draw).
+        // Retries are capped: a driver-side failure the driver reproduces deterministically would
+        // otherwise recompile and log at Force severity once per draw for the whole session, so
+        // after a few attempts the entry is promoted to permanent and the draws are skipped
+        if (++pipelineObj->transientFailureCount >= kMaxTransientPipelineCompileAttempts)
+        {
+            pipelineObj->permanentFailure = true;
+            MetalDiag_Count(MetalDiagEvent::PipelineCompileFailedPermanent,
+                "pipeline {:016x} failed {} times and gave up (last error was driver-side, see the compile log above)",
+                hash, pipelineObj->transientFailureCount);
+        }
+        else
+        {
+            m_pipelineCache.erase(it);
+            delete pipelineObj;
+            pipelineObj = nullptr;
+        }
     }
     if (pipelineObj)
     {
@@ -294,8 +372,12 @@ uint64 MetalPipelineCache::CalculatePipelineHash(const LatteFetchShader* fetchSh
 
 	const auto colorControlReg = ctxRegister[Latte::REGADDR::CB_COLOR_CONTROL];
 	stateHash += colorControlReg;
+	// rotate between the two: adding two register words back to back let (a, b) and (a + d, b - d)
+	// collide, and these two together decide blending and the write masks
+	stateHash = std::rotl<uint64>(stateHash, 7);
 
 	stateHash += ctxRegister[Latte::REGADDR::CB_TARGET_MASK];
+	stateHash = std::rotl<uint64>(stateHash, 7);
 
 	const uint32 blendEnableMask = (colorControlReg >> 8) & 0xFF;
 	if (blendEnableMask)
@@ -317,11 +399,19 @@ uint64 MetalPipelineCache::CalculatePipelineHash(const LatteFetchShader* fetchSh
 
     bool usesGeometryShader = (geometryShader != nullptr || isPrimitiveRect);
 
-    if (usesGeometryShader)
-    {
-        stateHash += lcr.GetRawView()[mmVGT_PRIMITIVE_TYPE];
-        stateHash = std::rotl<uint64>(stateHash, 7);
-    }
+    // The descriptor shape (mesh object/mesh functions vs. plain vertex/fragment) changes the
+    // pipeline, and the primitive mode was only keyed when the mesh path was taken. Key both
+    // unconditionally
+    stateHash = std::rotl<uint64>(stateHash, 7);
+    stateHash += usesGeometryShader ? 0x9E37u : 0x1B87u;
+    stateHash = std::rotl<uint64>(stateHash, 7);
+    stateHash += lcr.GetRawView()[mmVGT_PRIMITIVE_TYPE];
+
+    // whether the vertex stage fetches manually decides which vertex-descriptor path the compiler
+    // takes (MetalPipelineCompiler), so it belongs in the key too - it is a property of the fetch
+    // shader object, which the cache loader reconstructs separately from the live path
+    stateHash = std::rotl<uint64>(stateHash, 7);
+    stateHash += fetchShader->mtlFetchVertexManually ? 5u : 3u;
 
 	return stateHash;
 }
@@ -340,6 +430,38 @@ uint32 MetalPipelineCache::BeginLoading(uint64 cacheTitleId)
 	std::error_code ec;
 	fs::create_directories(ActiveSettings::GetCachePath("shaderCache/transferable"), ec);
 	const auto pathCacheFile = ActiveSettings::GetCachePath("shaderCache/transferable/{:016x}_mtlpipeline.bin", cacheTitleId);
+
+	// Load the previous session's archive for hits only - it is never written back (re-serializing a
+	// loaded archive does not round-trip, see the header), so this session's pipelines go into a fresh
+	// archive instead.
+	// Metal distinguishes the two operations by the descriptor's url: nil *creates*, a url *loads*.
+	// Loading happens before any pipeline is compiled, which is what lets Metal serve hits from it
+	{
+		m_binaryArchivePath = ActiveSettings::GetCachePath("shaderCache/transferable/{:016x}_mtlarchive.bin", cacheTitleId);
+
+		std::error_code archiveEc;
+		if (fs::exists(m_binaryArchivePath, archiveEc))
+		{
+			NS_STACK_SCOPED MTL::BinaryArchiveDescriptor* descriptor = MTL::BinaryArchiveDescriptor::alloc()->init();
+			descriptor->setUrl(ToNSURL(m_binaryArchivePath));
+
+			NS::Error* error = nullptr;
+			m_binaryArchiveRead = m_mtlr->GetDevice()->newBinaryArchive(descriptor, &error);
+			if (!m_binaryArchiveRead)
+			{
+				cemuLog_logOnce(LogType::Force, "Metal: could not open the pipeline binary archive {}{} - pipelines will be compiled from source",
+					m_binaryArchivePath, error ? fmt::format(" ({})", error->localizedDescription()->utf8String()) : std::string());
+			}
+			else
+			{
+				cemuLog_log(LogType::Force, "Metal: pipeline binary archive loaded ({})", m_binaryArchivePath);
+			}
+		}
+	}
+
+	// baseline for the session's pipeline-creation totals (see Close)
+	m_pipelineCreationTimeAtBegin = g_mtlPipelineCreationTimeNs.load();
+	m_pipelineCreationCountAtBegin = g_mtlPipelineCreationCount.load();
 
 	// init cache loader state
 	g_mtlCacheState.pipelineLoadIndex = 0;
@@ -365,7 +487,7 @@ uint32 MetalPipelineCache::BeginLoading(uint64 cacheTitleId)
 	{
 		// same critical section as the writer thread and Close() - see s_fileCacheMutex
 		std::lock_guard<std::mutex> lock(s_fileCacheMutex);
-		s_cache = FileCache::Open(pathCacheFile, true, LatteShaderCache_getPipelineCacheExtraVersion(cacheTitleId));
+		s_cache = FileCache::Open(pathCacheFile, true, LatteShaderCache_getPipelineCacheExtraVersion(cacheTitleId) + kMetalPipelineCacheFormatVersion);
 		if (!s_cache)
 		{
 			cemuLog_log(LogType::Force, "Failed to open or create Metal pipeline cache file: {}", _pathToUtf8(pathCacheFile));
@@ -379,10 +501,7 @@ uint32 MetalPipelineCache::BeginLoading(uint64 cacheTitleId)
 	// start async compilation threads
 	m_numCompilationThreads = numCompilationThreads;
 	for (uint32 i = 0; i < m_numCompilationThreads; i++)
-	{
-		std::thread compileThread(&MetalPipelineCache::CompilerThread, this);
-		compileThread.detach();
-	}
+		m_compilationThreads.emplace_back(&MetalPipelineCache::CompilerThread, this);
 	return fileCount;
 }
 
@@ -430,18 +549,173 @@ bool MetalPipelineCache::UpdateLoading(uint32& pipelinesLoadedTotal, uint32& pip
 
 void MetalPipelineCache::EndLoading()
 {
-	// shut down compilation threads
-	uint32 threadCount = m_numCompilationThreads;
-	m_numCompilationThreads = 0; // signal thread shutdown
-	for (uint32 i = 0; i < threadCount; i++)
-	{
-		m_compilationQueue.push({}); // push empty workload for every thread. Threads then will shutdown after checking for m_numCompilationThreads == 0
-	}
+	StopLoaderThreads();
 	// keep cache file open for writing of new pipelines
+}
+
+// Shuts the cache-loader threads down and joins them. A thread finishes the pipeline it is compiling;
+// entries still queued are dropped, because the loop exits once m_numCompilationThreads is 0
+void MetalPipelineCache::StopLoaderThreads()
+{
+	m_numCompilationThreads = 0; // signal thread shutdown
+	// one empty workload per thread wakes every thread blocked in pop(), so it sees the signal
+	for (size_t i = 0; i < m_compilationThreads.size(); i++)
+		m_compilationQueue.push({});
+	for (auto& thread : m_compilationThreads)
+		thread.join();
+	m_compilationThreads.clear();
+}
+
+void MetalPipelineCache::StopCompilation()
+{
+	stopCompileThreads();
+	StopLoaderThreads();
+}
+
+// call with m_binaryArchiveMutex held
+void MetalPipelineCache::NoteBinaryArchiveAdd(uint64 vertexBaseHash, uint64 pixelBaseHash)
+{
+    m_binaryArchiveDirty = true;
+    m_binaryArchiveAddCount++;
+    if (cemuLog_isLoggingEnabled(LogType::MetalBackend))
+        cemuLog_log(LogType::MetalBackend, "archive entry {}: vs {:016x} ps {:016x}", m_binaryArchiveAddCount, vertexBaseHash, pixelBaseHash);
+}
+
+// The write archive is created here, not at load: a session that only hits needs no file at all, and
+// creating an archive up front only to discard it would be wasted work. nil url = create (see header)
+// call with m_binaryArchiveMutex held
+MTL::BinaryArchive* MetalPipelineCache::EnsureBinaryArchiveWrite()
+{
+    if (m_binaryArchiveWrite)
+        return m_binaryArchiveWrite;
+
+    NS_STACK_SCOPED MTL::BinaryArchiveDescriptor* descriptor = MTL::BinaryArchiveDescriptor::alloc()->init();
+    NS::Error* error = nullptr;
+    m_binaryArchiveWrite = m_mtlr->GetDevice()->newBinaryArchive(descriptor, &error);
+    if (!m_binaryArchiveWrite)
+    {
+        cemuLog_logOnce(LogType::Force, "Metal: could not create a pipeline binary archive{}{} - this session's pipelines will not be cached",
+            error ? fmt::format(" ({})", error->localizedDescription()->utf8String()) : std::string(),
+            fmt::format(" for {}", m_binaryArchivePath));
+    }
+    return m_binaryArchiveWrite;
+}
+
+bool MetalPipelineCache::AddRenderPipelineToArchive(MTL::RenderPipelineDescriptor* descriptor, uint64 vertexBaseHash, uint64 pixelBaseHash)
+{
+    std::lock_guard<std::mutex> lock(m_binaryArchiveMutex);
+    MTL::BinaryArchive* archive = EnsureBinaryArchiveWrite();
+    if (!archive)
+        return false;
+    NS::Error* error = nullptr; // not reported: a failed add only costs a recompile next session
+    if (!archive->addRenderPipelineFunctions(descriptor, &error))
+        return false;
+    NoteBinaryArchiveAdd(vertexBaseHash, pixelBaseHash);
+    return true;
+}
+
+bool MetalPipelineCache::AddMeshRenderPipelineToArchive(MTL::MeshRenderPipelineDescriptor* descriptor, uint64 vertexBaseHash, uint64 pixelBaseHash)
+{
+    // archiving mesh pipelines needs macOS 15 (see MetalCppCompat.h)
+    if (__builtin_available(macOS 15.0, *))
+    {
+        std::lock_guard<std::mutex> lock(m_binaryArchiveMutex);
+        MTL::BinaryArchive* archive = EnsureBinaryArchiveWrite();
+        if (!archive)
+            return false;
+        NS::Error* error = nullptr;
+        if (!MetalCppCompat::BinaryArchiveAddMeshRenderPipelineFunctions(archive, descriptor, &error))
+            return false;
+        NoteBinaryArchiveAdd(vertexBaseHash, pixelBaseHash);
+        return true;
+    }
+    return false;
+}
+
+// Both archives, so a hit can come from the previous session's file or from one this session already
+// added. Autoreleased and consumed by the descriptor during the call that asked for it
+NS::Array* MetalPipelineCache::GetBinaryArchiveLookupArray()
+{
+    // the array retains both archives, so it stays valid after unlocking
+    std::lock_guard<std::mutex> lock(m_binaryArchiveMutex);
+    const NS::Object* archives[2];
+    uint32 count = 0;
+    if (m_binaryArchiveRead)
+        archives[count++] = m_binaryArchiveRead;
+    if (m_binaryArchiveWrite)
+        archives[count++] = m_binaryArchiveWrite;
+    if (count == 0)
+        return nullptr;
+    return NS::Array::array(archives, count);
 }
 
 void MetalPipelineCache::Close()
 {
+    // Persist what this session compiled (best effort: a failure only means the next launch recompiles).
+    // Written here rather than in the destructor; by now MetalRenderer::Shutdown has stopped the async
+    // compile pool and EndLoading has joined the loader threads, so no compile is in flight. Hits are
+    // re-added too, so the file is rewritten whenever this session created pipelines
+    std::unique_lock<std::mutex> archiveLock(m_binaryArchiveMutex);
+    if (m_binaryArchiveWrite && m_binaryArchiveDirty)
+    {
+        // size before the write, so the log line shows how much this session's additions grew the file
+        // - the file is meant to plateau once a title's pipelines are all in it, and a per-cycle jump
+        // much larger than the added entries' worth means serialization is packing more than them
+        std::error_code sizeBeforeEc;
+        const auto sizeBefore = fs::file_size(m_binaryArchivePath, sizeBeforeEc);
+
+        // serialize next to the file and rename it over the old one: the rename replaces it atomically,
+        // so a crash mid-write cannot corrupt it, and the read archive that still maps the old file keeps
+        // its inode
+        const std::string tmpPath = m_binaryArchivePath + ".tmp";
+        NS::Error* error = nullptr;
+        std::error_code renameEc;
+        bool written = m_binaryArchiveWrite->serializeToURL(ToNSURL(tmpPath), &error);
+        if (written)
+        {
+            fs::rename(tmpPath, m_binaryArchivePath, renameEc);
+            written = !renameEc;
+        }
+        if (!written)
+        {
+            std::error_code removeEc;
+            fs::remove(tmpPath, removeEc);
+            // Only this session's archive is lost, and the file on disk is left alone: it was written by
+            // an earlier session and is still loadable, so the next launch keeps its hits. Nothing here
+            // needs discarding any more - the failure cannot be inherited, because loaded content is
+            // never re-serialized (see the header)
+            cemuLog_log(LogType::Force, "Metal: could not write this session's pipeline binary archive ({}), it keeps the previous one",
+                renameEc ? renameEc.message() : std::string(error ? error->localizedDescription()->utf8String() : "unknown error"));
+        }
+        else
+        {
+            // the size is the only view of what the archive is actually holding: it should plateau
+            // once a title's pipelines are all in it, and the growth should be roughly the added
+            // entries' worth. Showing both ends makes a per-cycle inflation visible in one line
+            std::error_code sizeEc;
+            const auto sizeAfter = fs::file_size(m_binaryArchivePath, sizeEc);
+            cemuLog_log(LogType::Force, "Metal: pipeline binary archive written ({} entries added, {} MB -> {} MB)",
+                m_binaryArchiveAddCount,
+                sizeBeforeEc ? 0 : sizeBefore / (1024 * 1024),
+                sizeEc ? 0 : sizeAfter / (1024 * 1024));
+        }
+        m_binaryArchiveDirty = false;
+    }
+    archiveLock.unlock();
+
+    // What the archive is worth, in the only unit that matters: the wall-clock time this session spent
+    // creating pipelines. A cold session pays it and a warm one does not, so comparing this line across
+    // two runs of the same title is the mechanism's value. (Shader compilation - the OSD's "Compiled N
+    // new shaders" notice - is a different stage that the archive does not touch: Cemu needs each
+    // shader's function regardless, which is what the shader cache is for)
+    {
+        const uint64 creationTimeAtEnd = g_mtlPipelineCreationTimeNs.load();
+        const uint32 creationCountAtEnd = g_mtlPipelineCreationCount.load();
+        const uint32 created = creationCountAtEnd - m_pipelineCreationCountAtBegin;
+        const double seconds = (double)(creationTimeAtEnd - m_pipelineCreationTimeAtBegin) / 1e9;
+        cemuLog_log(LogType::Force, "Metal: this session created {} render pipelines in {:.2f} s (archive hits are counted too - they are just faster)", created, seconds);
+    }
+
     // the mutex is what makes the writer/loader threads' null checks meaningful - see s_fileCacheMutex
     std::lock_guard<std::mutex> lock(s_fileCacheMutex);
     if(s_cache)
@@ -748,7 +1022,7 @@ void MetalPipelineCache::WorkerThread()
 		{
 			std::lock_guard<std::mutex> lock(s_fileCacheMutex);
 			if (s_cache)
-				s_cache->AddFileAsync({ nameA, nameB }, blob.data(), blob.size());
+				s_cache->AddFileAsync({ nameA, nameB }, blob.data(), (sint32)blob.size());
 		}
 		delete job;
 	}

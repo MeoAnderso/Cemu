@@ -31,6 +31,9 @@ public:
     static void Initialize();
 	static void Shutdown();
 
+	// the Metal compile options every MSL compilation uses (shaders, stripped variants, the pack translator's check)
+	static MTL::CompileOptions* NewCompileOptions(class MetalRenderer* mtlr); // +1, caller releases
+
 	RendererShaderMtl(class MetalRenderer* mtlRenderer, ShaderType type, uint64 baseHash, uint64 auxHash, bool isGameShader, bool isGfxPackShader, const std::string& mslCode);
 	virtual ~RendererShaderMtl();
 
@@ -65,7 +68,10 @@ private:
 
 	MTL::Function* m_function = nullptr;
 
-	bool m_hasError = false;
+	// written by the shader-compile thread, read from the pipeline-compile pool and the render thread.
+	// The semaphore already orders those, but a plain bool would silently break if the ordering ever
+	// changed, and an atomic costs nothing here
+	std::atomic_bool m_hasError{ false };
 	// guards the one-time g_compiled_shaders_async stall decrement in PreponeCompilation
 	std::atomic_bool m_preponeCounted{ false };
 
@@ -82,11 +88,7 @@ private:
 
 	MTL::Library* LibraryFromSource();
 
-	//MTL::Library* LibraryFromAIR(std::span<uint8> data);
-
 	void CompileInternal();
-
-	//void CompileToAIR();
 
 	void FinishCompilation();
 };

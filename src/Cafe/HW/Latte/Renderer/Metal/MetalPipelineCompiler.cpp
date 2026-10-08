@@ -5,6 +5,8 @@
 #include "Cafe/HW/Latte/Renderer/Metal/CachedFBOMtl.h"
 #include "Cafe/HW/Latte/Renderer/Metal/LatteToMtl.h"
 #include "Cafe/HW/Latte/Renderer/Metal/RendererShaderMtl.h"
+#include "Cafe/HW/Latte/Renderer/Metal/MetalPipelineCache.h"
+#include "Cafe/HW/Latte/Renderer/Metal/MetalCppCompat.h"
 #include "Cafe/HW/Latte/Renderer/Metal/LatteTextureViewMtl.h"
 
 #include "Cafe/HW/Latte/Core/FetchShader.h"
@@ -17,6 +19,14 @@
 extern std::atomic_int g_compiling_pipelines;
 extern std::atomic_int g_compiling_pipelines_async;
 extern std::atomic_uint64_t g_compiling_pipelines_syncTimeSum;
+
+// Session totals of successfully created pipelines and what they cost, for the pipeline cache's
+// summary (MetalPipelineCache::Close). Deliberately separate from the counters above: those are
+// accumulated only on the render-thread path with overlay reporting on (see the showInOverlay block in
+// Compile), so the async compile pool and the shader-cache replay - where most creations happen - are
+// not in them, and the OSD exchanges the count to zero every time it draws its notice
+std::atomic_uint64_t g_mtlPipelineCreationTimeNs{ 0 };
+std::atomic_uint32_t g_mtlPipelineCreationCount{ 0 };
 
 static void rectsEmulationGS_outputSingleVertex(std::string& gsSrc, const LatteDecompilerShader* vertexShader, LatteShaderPSInputTable& psInputTable, sint32 vIdx, const LatteContextRegister& latteRegister)
 {
@@ -218,8 +228,7 @@ void SetFragmentState(T* desc, const MetalAttachmentsInfo& lastUsedAttachmentsIn
 
 		// Blending
 		bool blendEnabled = ((blendEnableMask & (1 << i))) != 0;
-		// everything except integer formats is blendable (matches Vulkan's InitBlendState; gating
-		// on FLOAT would silently drop the game's blending on UNORM/SNORM attachments)
+		// integer formats are not blendable (Vulkan's InitBlendState does the same); UNORM/SNORM are FLOAT in the format table
 		const auto dataType = GetMtlPixelFormatInfo(format, false).dataType;
 		if (blendEnabled && dataType != MetalDataType::UINT && dataType != MetalDataType::INT)
 		{
@@ -264,24 +273,6 @@ void SetFragmentState(T* desc, const MetalAttachmentsInfo& lastUsedAttachmentsIn
 
 MetalPipelineCompiler::~MetalPipelineCompiler()
 {
-    /*
-    for (auto& pair : m_pipelineCache)
-    {
-        pair.second->release();
-    }
-    m_pipelineCache.clear();
-
-    NS::Error* error = nullptr;
-    m_binaryArchive->serializeToURL(m_binaryArchiveURL, &error);
-    if (error)
-    {
-        cemuLog_log(LogType::Force, "error serializing binary archive: {}", error->localizedDescription()->utf8String());
-        error->release();
-    }
-    m_binaryArchive->release();
-
-    m_binaryArchiveURL->release();
-    */
     if (m_pipelineDescriptor)
         m_pipelineDescriptor->release();
     // the rect-emulation geometry shader is generated per pipeline compile and owned here;
@@ -295,12 +286,9 @@ void MetalPipelineCompiler::InitFromState(const LatteFetchShader* fetchShader, c
     m_usesGeometryShader = UseGeometryShader(lcr, geometryShader != nullptr);
     if (m_usesGeometryShader && !m_mtlr->SupportsMeshShaders())
     {
-        // The same condition the draw path reports as GeometryShaderUnsupported, reached instead from
-        // pipeline construction: the pipeline-cache loader replays a cache written on a mesh-capable
-        // machine, and the old silent return surfaced only as "Failed to compile pipeline restored
-        // from cache, skipping" while the census stayed empty for a loss it exists to name.
-        // Reported here and not in Compile(), which tests the same condition on the same compiler -
-        // reporting in both would count one pipeline twice
+        // the draw path's GeometryShaderUnsupported, reached from pipeline construction when the cache
+        // loader replays a cache written on a mesh-capable machine. Reported here and not in Compile(),
+        // which tests the same condition on the same compiler - reporting in both would count it twice
         MetalDiag_CountOncePer(MetalDiagEvent::GeometryShaderUnsupported,
             (uintptr_t)(geometryShader ? geometryShader->baseHash : 0),
             "geometry shader {:016x}_{:016x}{} cannot be built - no mesh shader support on this device",
@@ -333,6 +321,107 @@ void MetalPipelineCompiler::InitFromState(const LatteFetchShader* fetchShader, c
         InitFromStateMesh(fetchShader, lastUsedAttachmentsInfo, activeAttachmentsInfo, lcr);
     else
         InitFromStateRender(fetchShader, vertexShader, lastUsedAttachmentsInfo, activeAttachmentsInfo, lcr);
+}
+
+// Creates the pipeline state, consulting and then feeding the renderer's MTLBinaryArchive when one is
+// open. A miss just compiles; a failed add only means the entry is missing from the archive next
+// launch. Both are ignored on purpose - neither affects rendering.
+//
+// Both descriptor kinds are archived. The mesh path matters as much as the plain one: it covers
+// geometry-shader and RECTS emulation, whose mesh function is *generated* per pipeline, so a cache hit
+// saves generating and compiling it too.
+// The mesh descriptor's archive support is API_AVAILABLE(macos(15.0)), newer than the deployment
+// target (13.4) and than the pinned metal-cpp: the two calls are shimmed in MetalCppCompat.h, whose
+// availability attributes make the compiler enforce the __builtin_available guards
+template <typename TDescriptor>
+MTL::RenderPipelineState* MetalPipelineCompiler::CreatePipelineStateWithArchive(TDescriptor* desc, NS::Error** error)
+{
+    MetalRenderer* mtlr = m_mtlr;
+    MetalPipelineCache* pipelineCache = mtlr->GetPipelineCache();
+    // both archives, so a hit can come from the previous session's file or from one already added this
+    // session. Autoreleased, consumed by the descriptor during the creation call below
+    NS::Array* archives = pipelineCache ? pipelineCache->GetBinaryArchiveLookupArray() : nullptr;
+
+    const bool meshDescriptor = !std::is_same_v<TDescriptor, MTL::RenderPipelineDescriptor>;
+    // Can this pipeline be archived at all? Two independent reasons it cannot:
+    // - it has no fragment stage. The packer requires one ("expecting 'fragment' stage in pipeline no.
+    //   N") and serializeToURL is all-or-nothing, so one such entry would cost the whole file. This
+    //   mirrors exactly what gives the descriptor its fragment function: the emitters set it only when
+    //   rasterization is enabled, and ResolveFragmentFunction returns null when there is no pixel shader
+    //   (which Compile's early check does not catch, because its "m_pixelShaderMtl &&" test
+    //   short-circuits). Both cases are legal to create and are created normally - just not archived.
+    // - it is a mesh pipeline on an OS that predates the mesh archive API (see above)
+    // Note this is decided from the pipeline, not from whether an archive already exists: on a title's
+    // first run there is none, and it is this session's additions that create the file
+    const bool hasFragmentStage = m_rasterizationEnabled && m_pixelShaderMtl && m_pixelShaderMtl->GetFunction();
+    bool meshArchiveAvailable = false;
+    if (__builtin_available(macOS 15.0, *))
+        meshArchiveAvailable = true;
+    const bool canArchive = hasFragmentStage && (!meshDescriptor || meshArchiveAvailable);
+    if (!canArchive)
+    {
+        MetalDiag_Count(MetalDiagEvent::PipelineArchiveSkipped, "vs {:016x} ps {:016x} (rasterization {} pixel shader {})",
+            m_vertexShaderMtl ? m_vertexShaderMtl->GetBaseHash() : 0, m_pixelShaderMtl ? m_pixelShaderMtl->GetBaseHash() : 0,
+            m_rasterizationEnabled ? "on" : "off", m_pixelShaderMtl ? "present" : "absent");
+    }
+
+    // Attaching an archive is what enables a hit, so it needs one to exist; adding does not
+    if (archives && canArchive)
+    {
+        if constexpr (std::is_same_v<TDescriptor, MTL::RenderPipelineDescriptor>)
+            desc->setBinaryArchives(archives);
+        else if (__builtin_available(macOS 15.0, *))
+            MetalCppCompat::MeshRenderPipelineDescriptorSetBinaryArchives(desc, archives);
+
+        // Verification mode, not the normal path: FailOnBinaryArchiveMiss makes a successful creation
+        // mean "the archive served this pipeline", which is the only way a hit is observable (Metal
+        // reports nothing otherwise), and the census counts them. It is only probed when the user asked
+        // for Metal backend detail (Debug -> Logging) because a miss is documented as an error return
+        // while an unexpected MTLReportFailure under API validation would abort the process - so the
+        // default path stays the plain attach-and-compile that is known to be safe.
+        // With the category off the archive is still attached and still used, just not observed
+        if (cemuLog_isLoggingEnabled(LogType::MetalBackend))
+        {
+            MTL::RenderPipelineState* archived = mtlr->GetDevice()->newRenderPipelineState(desc, MTL::PipelineOptionFailOnBinaryArchiveMiss, nullptr, nullptr);
+            if (archived)
+            {
+                MetalDiag_Count(MetalDiagEvent::PipelineArchiveHit, "vs {:016x} ps {:016x}",
+                    m_vertexShaderMtl ? m_vertexShaderMtl->GetBaseHash() : 0, m_pixelShaderMtl ? m_pixelShaderMtl->GetBaseHash() : 0);
+                // Carried into this session's write archive as well. The file is rebuilt from the
+                // pipelines this session used, so one served by a hit has to be re-added too - otherwise
+                // the next file would hold only the misses and coverage would shrink every cycle.
+                // (Without the probe this is not needed: creation without FailOnBinaryArchiveMiss goes
+                // through the normal path below and is added there either way)
+                const uint64 vertexHash = m_vertexShaderMtl ? m_vertexShaderMtl->GetBaseHash() : 0;
+                const uint64 pixelHash = m_pixelShaderMtl ? m_pixelShaderMtl->GetBaseHash() : 0;
+                if (pipelineCache)
+                {
+                    if constexpr (std::is_same_v<TDescriptor, MTL::RenderPipelineDescriptor>)
+                        pipelineCache->AddRenderPipelineToArchive(desc, vertexHash, pixelHash);
+                    else
+                        pipelineCache->AddMeshRenderPipelineToArchive(desc, vertexHash, pixelHash);
+                }
+                return archived;
+            }
+            MetalDiag_Count(MetalDiagEvent::PipelineArchiveMiss, "vs {:016x} ps {:016x}",
+                m_vertexShaderMtl ? m_vertexShaderMtl->GetBaseHash() : 0, m_pixelShaderMtl ? m_pixelShaderMtl->GetBaseHash() : 0);
+        }
+    }
+
+    MTL::RenderPipelineState* pipeline = mtlr->GetDevice()->newRenderPipelineState(desc, MTL::PipelineOptionNone, nullptr, error);
+
+    if (pipeline && canArchive && pipelineCache)
+    {
+        // goes into the cache's fresh write archive (never the loaded one - see the header), so the
+        // file written at exit holds exactly this session's pipelines
+        const uint64 vertexHash = m_vertexShaderMtl ? m_vertexShaderMtl->GetBaseHash() : 0;
+        const uint64 pixelHash = m_pixelShaderMtl ? m_pixelShaderMtl->GetBaseHash() : 0;
+        if constexpr (std::is_same_v<TDescriptor, MTL::RenderPipelineDescriptor>)
+            pipelineCache->AddRenderPipelineToArchive(desc, vertexHash, pixelHash);
+        else
+            pipelineCache->AddMeshRenderPipelineToArchive(desc, vertexHash, pixelHash);
+    }
+    return pipeline;
 }
 
 bool MetalPipelineCompiler::Compile(bool forceCompile, bool isRenderThread, bool showInOverlay)
@@ -412,7 +501,7 @@ bool MetalPipelineCompiler::Compile(bool forceCompile, bool isRenderThread, bool
         desc->setLabel(ToNSString(fmt::format("rps mesh vs{:016x} gs{:016x} ps{:016x}",
             m_vertexShaderMtl->GetBaseHash(), m_geometryShaderMtl ? m_geometryShaderMtl->GetBaseHash() : 0,
             m_pixelShaderMtl ? m_pixelShaderMtl->GetBaseHash() : 0)));
-       	pipeline = m_mtlr->GetDevice()->newRenderPipelineState(desc, MTL::PipelineOptionNone, nullptr, &error);
+       	pipeline = CreatePipelineStateWithArchive(desc, &error);
     }
     else
     {
@@ -426,7 +515,7 @@ bool MetalPipelineCompiler::Compile(bool forceCompile, bool isRenderThread, bool
         // label with the game-side shader identity so GPU traces are searchable
         desc->setLabel(ToNSString(fmt::format("rps vs{:016x} ps{:016x}",
             m_vertexShaderMtl->GetBaseHash(), m_pixelShaderMtl ? m_pixelShaderMtl->GetBaseHash() : 0)));
-       	pipeline = m_mtlr->GetDevice()->newRenderPipelineState(desc, MTL::PipelineOptionNone, nullptr, &error);
+       	pipeline = CreatePipelineStateWithArchive(desc, &error);
     }
     auto end = std::chrono::high_resolution_clock::now();
 
@@ -438,6 +527,7 @@ bool MetalPipelineCompiler::Compile(bool forceCompile, bool isRenderThread, bool
 		// identify the failing pipeline so it can be reproduced: shader hashes, the
 		// framebuffer-fetch slots the PS reads (textureRenderTargetIndex) and the formats the
 		// pipeline declared
+		if (cemuLog_isLoggingEnabled(LogType::MetalBackend))
 		{
 			std::string fmts;
 			for (uint8 i = 0; i < LATTE_NUM_COLOR_TARGET; i++)
@@ -453,7 +543,7 @@ bool MetalPipelineCompiler::Compile(bool forceCompile, bool isRenderThread, bool
 						fetch += fmt::format("u{}->c{} ", (uint32)u, (uint32)m_pixelShader->textureRenderTargetIndex[u]);
 				}
 			}
-			cemuLog_log(LogType::Force, "[PIPETRACE] PS {:016x}_{:016x} GS {} outMask {:04x} depth {:04x} stencil {} raster {} fetch[{}] declared[{}]",
+			cemuLog_log(LogType::MetalBackend, "pipeline failure detail: PS {:016x}_{:016x} GS {} outMask {:04x} depth {:04x} stencil {} raster {} fetch[{}] declared[{}]",
 				m_pixelShader ? m_pixelShader->baseHash : 0,
 				m_pixelShader ? m_pixelShader->auxHash : 0,
 				m_usesGeometryShader ? 1 : 0,
@@ -464,6 +554,14 @@ bool MetalPipelineCompiler::Compile(bool forceCompile, bool isRenderThread, bool
 		}
 		// the out-param error is autoreleased (metal-cpp does not retain it) - do not release it
 	}
+
+    // the session totals count every successful creation on any path (see the declarations above) -
+    // what the binary archive exists to skip
+    if (pipeline)
+    {
+        g_mtlPipelineCreationTimeNs += creationDuration;
+        g_mtlPipelineCreationCount++;
+    }
 
     if (showInOverlay)
 	{
@@ -494,44 +592,44 @@ bool MetalPipelineCompiler::Compile(bool forceCompile, bool isRenderThread, bool
 	return true;
 }
 
-	// Resolves the fragment function for the pipeline, stripping orphaned color outputs when
-	// the active FBO does not attach all the slots the shader writes. Metal rejects a pipeline
-	// whose fragment function declares [[color(N)]] without a matching attachment (Vulkan
-	// silently ignores such outputs), which made depth-only passes with color-writing shaders
-	// fail pipeline creation forever and dropped their draws every frame
-	MTL::Function* MetalPipelineCompiler::ResolveFragmentFunction()
+// Resolves the fragment function for the pipeline, stripping orphaned color outputs when
+// the active FBO does not attach all the slots the shader writes. Metal rejects a pipeline
+// whose fragment function declares [[color(N)]] without a matching attachment (Vulkan
+// silently ignores such outputs), which made depth-only passes with color-writing shaders
+// fail pipeline creation forever and dropped their draws every frame
+MTL::Function* MetalPipelineCompiler::ResolveFragmentFunction()
 {
-		// m_pixelShaderMtl is dereferenced before m_pixelShader is checked below, and the early
-		// sanity check in Compile() short-circuits past a null m_pixelShaderMtl (it tests
-		// "m_pixelShaderMtl && !GetFunction()"), so a null stage would be dereferenced here
-		if (!m_pixelShaderMtl)
-			return nullptr;
-		MTL::Function* fragmentFunction = m_pixelShaderMtl->GetFunction();
-		if (!m_pixelShader)
-			return fragmentFunction;
-		uint32 declaredMask = 0;
-		for (uint8 i = 0; i < LATTE_NUM_COLOR_TARGET; i++)
-		{
-			if (m_activeAttachmentsInfo.colorFormats[i] != Latte::E_GX2SURFFMT::INVALID_FORMAT)
-				declaredMask |= (1u << i);
-		}
-		const uint32 orphanMask = m_pixelShader->pixelColorOutputMask & ~declaredMask;
-		// orphan depth output: the shader writes [[depth(any)]] but the active FBO has no depth
-		// attachment - Metal rejects the pipeline (Vulkan silently ignores orphan depth exports),
-		// which made such passes fail pipeline creation and drop their draws every frame
-		const bool orphanDepth = m_pixelShader->depthMask && m_activeAttachmentsInfo.depthFormat == Latte::E_GX2SURFFMT::INVALID_FORMAT;
-		if (orphanMask == 0 && !orphanDepth)
-			return fragmentFunction;
-		// the combined variant removes both the orphan colors and the depth output in one
-		// surgery - stripping only one would leave the other orphan output declared
-		MTL::Function* stripped = m_pixelShaderMtl->GetStrippedVariant(orphanMask, orphanDepth);
-		if (stripped)
-		{
-			cemuLog_logOnce(LogType::Force, "stripping orphan outputs (colors {:05x} depth {}) from PS {:016x}_{:016x} (depth-only or partial MRT pass)", orphanMask, orphanDepth ? 1 : 0, m_pixelShader->baseHash, m_pixelShader->auxHash);
-			return stripped;
-		}
+	// m_pixelShaderMtl is dereferenced before m_pixelShader is checked below, and the early
+	// sanity check in Compile() short-circuits past a null m_pixelShaderMtl (it tests
+	// "m_pixelShaderMtl && !GetFunction()"), so a null stage would be dereferenced here
+	if (!m_pixelShaderMtl)
+		return nullptr;
+	MTL::Function* fragmentFunction = m_pixelShaderMtl->GetFunction();
+	if (!m_pixelShader)
 		return fragmentFunction;
+	uint32 declaredMask = 0;
+	for (uint8 i = 0; i < LATTE_NUM_COLOR_TARGET; i++)
+	{
+		if (m_activeAttachmentsInfo.colorFormats[i] != Latte::E_GX2SURFFMT::INVALID_FORMAT)
+			declaredMask |= (1u << i);
 	}
+	const uint32 orphanMask = m_pixelShader->pixelColorOutputMask & ~declaredMask;
+	// orphan depth output: the shader writes [[depth(any)]] but the active FBO has no depth
+	// attachment - Metal rejects the pipeline (Vulkan silently ignores orphan depth exports),
+	// which made such passes fail pipeline creation and drop their draws every frame
+	const bool orphanDepth = m_pixelShader->depthMask && m_activeAttachmentsInfo.depthFormat == Latte::E_GX2SURFFMT::INVALID_FORMAT;
+	if (orphanMask == 0 && !orphanDepth)
+		return fragmentFunction;
+	// the combined variant removes both the orphan colors and the depth output in one
+	// surgery - stripping only one would leave the other orphan output declared
+	MTL::Function* stripped = m_pixelShaderMtl->GetStrippedVariant(orphanMask, orphanDepth);
+	if (stripped)
+	{
+		cemuLog_logOnce(LogType::Force, "stripping orphan outputs (colors {:05x} depth {}) from PS {:016x}_{:016x} (depth-only or partial MRT pass)", orphanMask, orphanDepth ? 1 : 0, m_pixelShader->baseHash, m_pixelShader->auxHash);
+		return stripped;
+	}
+	return fragmentFunction;
+}
 
 void MetalPipelineCompiler::InitFromStateRender(const LatteFetchShader* fetchShader, const LatteDecompilerShader* vertexShader, const MetalAttachmentsInfo& lastUsedAttachmentsInfo, const MetalAttachmentsInfo& activeAttachmentsInfo, const LatteContextRegister& lcr)
 {

@@ -26,13 +26,14 @@ public:
 	// the decompiled MSL never emits (the same texture unit may sample a color or a depth texture
 	// depending on what the game binds), so depth-as-data sampling goes through this copy instead.
 	// Mirrors GL/Vulkan semantics, where sampling a depth texture via a regular sampler returns the
-	// depth value in the red channel. Managed by MetalRenderer::depthCopy_refreshColorCopy
+	// depth value in the red channel. Managed by MetalRenderer::depthCopy_ensureColorCopy /
+	// depthCopy_refreshColorCopyBeforeDraw
 	MTL::Texture* GetDepthColorCopy() const {
 		return m_depthColorCopy;
 	}
 
 	// updateEventCounter tracks the data version the copy was taken at (the depth texture's
-	// lastWriteEventCounter), so MetalRenderer::depthCopy_refreshColorCopy can detect writes
+	// lastWriteEventCounter), so MetalRenderer::depthCopy_refreshColorCopyBeforeDraw can detect writes
 	// that happen mid-frame (e.g. shadow maps being rewritten between sampling draws)
 	void SetDepthColorCopy(MTL::Texture* colorCopy, uint64 updateEventCounter) {
 		if (m_depthColorCopy && m_depthColorCopy != colorCopy)
@@ -51,15 +52,13 @@ public:
 		return m_depthColorCopyUpdateCounter;
 	}
 
-	// Cached sample view of the depth color-copy mirror for the given bound view + sampler swizzle
-	// (created + released per draw before - one driver allocation per draw). The cache owns the
-	// returned view (do not release); it is invalidated when the mirror is replaced
+	// Cached sample view of the depth color-copy mirror for the given bound view + sampler swizzle.
+	// The cache owns the returned view (do not release); it is invalidated when the mirror is replaced
 	MTL::Texture* GetDepthMirrorSampleView(LatteTextureView* textureView, uint32 gpuSamplerSwizzle);
 
-	// rate limiting for the refresh (see depthCopy_refreshColorCopy): refreshes within the same
-	// frame are capped so a game alternating depth writes and depth-as-data sampling every draw
-	// cannot trigger a side command buffer per draw. Mid-frame rewrites within the cap are still
-	// refreshed (keeps shadow clouds coherent)
+	// rate limiting for the refresh (see depthCopy_refreshColorCopyBeforeDraw): every refresh breaks
+	// the render pass, so refreshes are capped per frame. Mid-frame rewrites within the cap are still
+	// refreshed (keeps shadow maps rewritten between sampling draws coherent)
 	void TrackDepthColorCopyRefresh(uint32 frameCounter) {
 		if (m_depthColorCopyLastRefreshFrame != frameCounter)
 		{
@@ -73,19 +72,17 @@ public:
 		return m_depthColorCopyLastRefreshFrame == frameCounter && m_depthColorCopyRefreshesThisFrame >= cap;
 	}
 
-	// Mip-content tracking: bit i is set when a render pass or copy wrote mip level i. Games
-	// like SM3DW sample effect buffers through their full mip chain with forced LODs while only
-	// mip 0 ever receives content from the game. MetalRenderer::EnsureSampledMipContentValid
-	// uses the mask to detect these never-managed chains and regenerate the upper levels from
-	// the fresh render-written mip0
+	// Mip-content tracking: bit i is set when a render pass or copy wrote mip level i. The opt-in
+	// MetalRenderer::EnsureSampledMipContentValid requires mip 0 here to regenerate the upper levels
+	// of a chain the game never manages
 	uint32 GetRenderWrittenMipMask() const {
 		return m_renderWrittenMipMask;
 	}
 
 	void MarkRenderMipsWritten(uint32 firstMip, uint32 numMips) {
-		if (firstMip >= 32)
-			return;
-		m_renderWrittenMipMask |= (numMips >= 32 ? 0xFFFFFFFFu : ((1u << numMips) - 1u) << firstMip);
+		// one range helper (MipRangeMask) for every mask, so setting and clearing agree on ranges
+		// that don't fit the 32-bit mask
+		m_renderWrittenMipMask |= MipRangeMask(firstMip, numMips);
 	}
 
 	// Mips written by game render passes only. Cemu's own copy paths (alias preservation,
@@ -98,16 +95,9 @@ public:
 	}
 
 	void MarkPassMipsWritten(uint32 firstMip, uint32 numMips) {
-		if (firstMip >= 32)
-			return;
-		m_passWrittenMipMask |= (numMips >= 32 ? 0xFFFFFFFFu : ((1u << numMips) - 1u) << firstMip);
-		// a render pass supersedes whatever a copy or a clear put into these levels, so their
-		// provenance is dropped here (see MarkCopyMipsWritten / MarkLevelCleared)
-		const uint32 range = MipRangeMask(firstMip, numMips);
-		m_clearedMipMask &= ~range;
-		m_matchedCopyMipMask &= ~range;
-		m_resampledCopyMipMask &= ~range;
-		m_partialCopyMipMask &= ~range;
+		// the copy/clear masks are kept: the pass bit alone makes the level trusted
+		// (LevelContentIsTrustworthy ORs it in), and the regeneration gate reads every provenance bit
+		m_passWrittenMipMask |= MipRangeMask(firstMip, numMips);
 	}
 
 	// What the last copy into a mip level did to that level. Three outcomes, because they are the
@@ -161,7 +151,7 @@ public:
 		const uint32 range = MipRangeMask(mip, 1);
 		if (range == 0)
 			return;
-		m_clearedMipMask = (m_clearedMipMask & ~range) | range;
+		m_clearedMipMask |= range;
 		m_matchedCopyMipMask &= ~range;
 		m_resampledCopyMipMask &= ~range;
 		m_partialCopyMipMask &= ~range;
@@ -258,9 +248,7 @@ public:
 	// The trust/clamp/regeneration diagnostics latch through MetalDiag_CountOncePer /
 	// MetalDiag_CountFirstSighting, keyed per texture - see MetalDiagnostics.h for the policy
 
-	// event counter of the lastWriteEventCounter value at which generateMipmaps last ran for
-	// this texture (0 = never). EnsuredMipContentIsCurrent(lastWriteEventCounter) is false when
-	// the mip0 content changed since the last regeneration
+	// the lastWriteEventCounter value at which generateMipmaps last ran for this texture (0 = never)
 	uint64 GetMipGenerationEventCounter() const {
 		return m_mipGenerationEventCounter;
 	}

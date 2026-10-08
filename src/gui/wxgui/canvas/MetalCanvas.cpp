@@ -40,7 +40,13 @@ MetalCanvas::~MetalCanvas()
 
 	MetalRenderer* mtlr = (MetalRenderer*)g_renderer.get();
 	if (mtlr)
+	{
+		// the render thread may be mid-frame on the DRC window's layer: ask it to stop and wait
+		// before tearing that layer down (VulkanCanvas does the same)
+		if (!m_is_main_window)
+			mtlr->StopUsingPadAndWait();
 		mtlr->ShutdownLayer(m_is_main_window);
+	}
 }
 
 void MetalCanvas::OnPaint(wxPaintEvent& event)

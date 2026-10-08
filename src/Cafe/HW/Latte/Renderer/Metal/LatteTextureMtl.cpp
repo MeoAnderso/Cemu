@@ -111,8 +111,10 @@ MTL::Texture* LatteTextureMtl::GetDepthMirrorSampleView(LatteTextureView* textur
 
 	// sample the copy with the same component swizzle the game requested (Vulkan samples a
 	// swizzled depth view) and over the full mip chain. The view type and slice range match the
-	// bound view so 2D-array shadow maps sample the correct cascade layer
-	const auto swizzle = LatteTextureViewMtl::GetSwizzleChannels(format, gpuSamplerSwizzle);
+	// bound view so 2D-array shadow maps sample the correct cascade layer. The swizzle is derived
+	// from the bound view's format, not this base texture's - that is what the cache key above and
+	// every other view builder (LatteTextureViewMtl, MetalRenderer::CreateFeedbackShadowView) use
+	const auto swizzle = LatteTextureViewMtl::GetSwizzleChannels(textureView->format, gpuSamplerSwizzle);
 	const bool mirrorIsArray = (textureView->dim == Latte::E_DIM::DIM_2D_ARRAY);
 	const MTL::TextureType sampleType = mirrorIsArray ? MTL::TextureType2DArray : MTL::TextureType2D;
 	NS::Range sliceRange = mirrorIsArray ? NS::Range::Make(textureView->firstSlice, textureView->numSlice) : NS::Range::Make(textureView->firstSlice, 1);
@@ -141,11 +143,7 @@ LatteTextureMtl::~LatteTextureMtl()
 	auto& shadowCopies = m_mtlr->m_feedbackShadowCopies;
 	auto shadowItr = shadowCopies.find(this);
 	if (shadowItr != shadowCopies.end())
-	{
-		if (shadowItr->second.texture)
-			shadowItr->second.texture->release();
 		shadowCopies.erase(shadowItr);
-	}
 	m_mtlr->m_feedbackShadowTextures.erase(this);
 }
 

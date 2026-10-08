@@ -258,10 +258,7 @@ void LatteThread_Exit()
     LatteSHRC_UnloadAll();
     // close disk cache
     LatteShaderCache_Close();
-	// one-block summary of the backend fallbacks that happened this session - the point of the
-	// exercise is that a user can paste it into a report instead of having to be talked through
-	// which log lines matter (silent when nothing was recorded, and a no-op on backends that keep
-	// no such census). g_renderer is still valid here - it is deleted below
+	// log the backend fallback census before the renderer is destroyed
 	if (g_renderer)
 		g_renderer->LogDiagnosticsSummary();
 	RendererOutputShader::ShutdownStatic();

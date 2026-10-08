@@ -35,12 +35,7 @@ vertex void vertexCopyBufferToBuffer(uint vid [[vertex_id]], device uint8_t* src
 }
 
 fragment float4 fragmentCopyDepthToColor(VertexOut in [[stage_in]], texture2d<float, access::read> src [[texture(GET_TEXTURE_BINDING(0))]]) {
-    // Only .r carries the depth value; g/b/a stay 0 to match the Vulkan copy shader, which writes
-    // colorOut0.r only (_vkGenSurfaceCopyShader_ps_depthToColor, VulkanSurfaceCopy.cpp:206-217) and
-    // therefore leaves the other components at 0 in practice. This shader is used for two things:
-    // the depth mirror (R32Float/R16Float - single channel, so g/b/a are irrelevant) and the
-    // depth->color surface copy (surfaceCopy_viaDrawcall), where the destination IS a color
-    // attachment and its alpha is sampled by the game - writing a = 1.0 there diverged from Vulkan
+    // only .r carries depth; g/b/a stay 0 to match Vulkan's depth->color copy
     return float4(src.read(uint2(in.position.xy)).r, 0.0, 0.0, 0.0);
 }
 

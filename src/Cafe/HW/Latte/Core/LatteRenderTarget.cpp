@@ -230,55 +230,66 @@ LatteTextureView* LatteMRT_CreateDepthBuffer(MPTR depthBufferPhysMem, uint32 wid
 
 sint32 _depthBufferSizeWarningCount = 0;
 
-// NOTE: the Metal backend has a read-only mirror of this address/dimension decoding in
-// LatteShader.cpp (MtlResolveColorBufferViewForFetchCheck) - keep both in sync when changing
-// the buffer-base/size derivation or the scissor-based resolution heuristic
-LatteTextureView* LatteMRT::GetColorAttachmentTexture(uint32 index, bool createNew, bool checkForTextureChanges)
+// Decoding shared with the Metal backend's framebuffer-fetch check (LatteShader.cpp) - both call this,
+// so the buffer-base/size derivation and the scissor-based resolution heuristic cannot drift apart
+LatteMRT::ColorBufferViewDecode LatteMRT::DecodeColorBufferView(uint32 index, const uint32* contextRegisters, const LatteContextRegister& lcr)
 {
-	uint32* colorBufferRegBase = LatteGPUState.contextRegister+(mmCB_COLOR0_BASE + index);
+	ColorBufferViewDecode decode{};
+	const uint32* colorBufferRegBase = contextRegisters + (mmCB_COLOR0_BASE + index);
 	uint32 regColorBufferBase = colorBufferRegBase[mmCB_COLOR0_BASE - mmCB_COLOR0_BASE] & 0xFFFFFF00; // the low 8 bits are ignored? How to Survive seems to rely on this
 	uint32 regColorSize = colorBufferRegBase[mmCB_COLOR0_SIZE - mmCB_COLOR0_BASE];
 	uint32 regColorInfo = colorBufferRegBase[mmCB_COLOR0_INFO - mmCB_COLOR0_BASE];
 	uint32 regColorView = colorBufferRegBase[mmCB_COLOR0_VIEW - mmCB_COLOR0_BASE];
 	// decode color buffer reg info
-	Latte::E_HWTILEMODE colorBufferTileMode = (Latte::E_HWTILEMODE)((regColorInfo >> 8) & 0xF);
-	uint32 numberType = (regColorInfo >> 12) & 7;
-	Latte::E_GX2SURFFMT colorBufferFormat = GetColorBufferFormat(index, LatteGPUState.contextNew);
+	decode.tileMode = (Latte::E_HWTILEMODE)((regColorInfo >> 8) & 0xF);
+	decode.format = GetColorBufferFormat(index, lcr);
 
-	MPTR colorBufferPhysMem = regColorBufferBase;
-
-	uint32 colorBufferSwizzle = 0;
-	if ( Latte::TM_IsMacroTiled(colorBufferTileMode) )
+	decode.physAddress = regColorBufferBase;
+	decode.swizzle = 0;
+	if (Latte::TM_IsMacroTiled(decode.tileMode))
 	{
-		colorBufferSwizzle = colorBufferPhysMem & 0x700;
-		colorBufferPhysMem = colorBufferPhysMem & ~(7 << 8);
+		decode.swizzle = decode.physAddress & 0x700;
+		decode.physAddress = decode.physAddress & ~(7 << 8);
 	}
 
 	// get view slice and view slice num
-	uint32 viewFirstSlice = (regColorView & 0x7FF);
-	uint32 viewNumSlices = ((regColorView >> 13) & 0x7FF) - viewFirstSlice + 1;
-	if (viewNumSlices != 1)
+	decode.firstSlice = (regColorView & 0x7FF);
+	decode.numSlices = ((regColorView >> 13) & 0x7FF) - decode.firstSlice + 1;
+	if (decode.numSlices != 1)
 	{
-		debug_printf("viewNumSlices is not 1! (%d)\n", viewNumSlices);
+		debug_printf("viewNumSlices is not 1! (%d)\n", decode.numSlices);
 	}
-	uint32 colorBufferPitch = (((regColorSize >> 0) & 0x3FF) + 1);
-	colorBufferPitch <<= 3;
-	uint32 pitchHeight = (((regColorSize >> 10) & 0xFFFFF) + 1);
-	pitchHeight <<= 6;
-	uint32 colorBufferHeight = pitchHeight / colorBufferPitch;
-	uint32 colorBufferWidth = colorBufferPitch;
+	decode.pitch = (((regColorSize >> 0) & 0x3FF) + 1) << 3;
+	uint32 pitchHeight = (((regColorSize >> 10) & 0xFFFFF) + 1) << 6;
+	decode.height = pitchHeight / decode.pitch;
+	decode.width = decode.pitch;
 
 	// colorbuffer width/height has to be padded to 8/32 alignment but the actual resolution might be smaller
 	// use the scissor box as a clue to figure out the original resolution if possible
-	if(LatteGPUState.allowFramebufferSizeOptimization)
+	if (LatteGPUState.allowFramebufferSizeOptimization)
 	{
-		uint32 scissorBoxWidth = LatteGPUState.contextNew.PA_SC_GENERIC_SCISSOR_BR.get_BR_X();
-		uint32 scissorBoxHeight = LatteGPUState.contextNew.PA_SC_GENERIC_SCISSOR_BR.get_BR_Y();
-		if (((scissorBoxWidth + 7) & ~7) == colorBufferWidth)
-			colorBufferWidth = scissorBoxWidth;
-		if (((colorBufferHeight + 31) & ~31) == colorBufferHeight)
-			colorBufferHeight = scissorBoxHeight;
+		uint32 scissorBoxWidth = lcr.PA_SC_GENERIC_SCISSOR_BR.get_BR_X();
+		uint32 scissorBoxHeight = lcr.PA_SC_GENERIC_SCISSOR_BR.get_BR_Y();
+		if (((scissorBoxWidth + 7) & ~7) == decode.width)
+			decode.width = scissorBoxWidth;
+		if (((decode.height + 31) & ~31) == decode.height)
+			decode.height = scissorBoxHeight;
 	}
+	return decode;
+}
+
+LatteTextureView* LatteMRT::GetColorAttachmentTexture(uint32 index, bool createNew, bool checkForTextureChanges)
+{
+	const ColorBufferViewDecode decoded = DecodeColorBufferView(index, LatteGPUState.contextRegister, LatteGPUState.contextNew);
+	MPTR colorBufferPhysMem = decoded.physAddress;
+	uint32 colorBufferSwizzle = decoded.swizzle;
+	uint32 colorBufferWidth = decoded.width;
+	uint32 colorBufferHeight = decoded.height;
+	uint32 colorBufferPitch = decoded.pitch;
+	uint32 viewFirstSlice = decoded.firstSlice;
+	uint32 viewNumSlices = decoded.numSlices;
+	Latte::E_HWTILEMODE colorBufferTileMode = decoded.tileMode;
+	Latte::E_GX2SURFFMT colorBufferFormat = decoded.format;
 
 	// log resolution changes if the above heuristic takes effect
 	// this is useful to find resolutions which need to be updated in gfx pack texture rules

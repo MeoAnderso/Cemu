@@ -448,6 +448,10 @@ struct CemuConfig
 	ConfigValue<bool> async_compile{ true };
 #ifdef ENABLE_METAL
 	ConfigValue<bool> force_mesh_shaders{ false };
+	// Metal-only: the sampled-mip clamp and mip-chain regeneration. Both make Metal serve mip
+	// content the game did not write (Vulkan does neither), so they are off unless a user opts in.
+	// Read per draw, so toggling it takes effect without a restart
+	ConfigValue<bool> mtl_sampled_mip_workarounds{ false };
 #endif
 
 	// Gamma

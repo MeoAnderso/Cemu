@@ -2,7 +2,7 @@
 
 #include "Cafe/HW/Latte/Renderer/MetalView.h"
 
-void* CreateMetalLayer(void* handle, float& scaleX, float& scaleY)
+void* CreateMetalLayer(void* handle, float& scaleX, float& scaleY, void** childViewOut)
 {
 	NSView* view = (NSView*)handle;
 
@@ -12,20 +12,46 @@ void* CreateMetalLayer(void* handle, float& scaleX, float& scaleY)
 
 	[view addSubview:childView];
 
-	const NSRect points = [childView frame];
-    const NSRect pixels = [childView convertRectToBacking:points];
+	// the superview owns the view from here on, but the caller keeps the raw pointer so it can remove
+	// it again (DestroyMetalLayer) - it outlives game sessions otherwise
+	if (childViewOut)
+		*childViewOut = childView;
 
-	scaleX = (float)(pixels.size.width / points.size.width);
-    scaleY = (float)(pixels.size.height / points.size.height);
+	GetMetalViewScale(childView, scaleX, scaleY);
 
-	// These files are built without ARC, so ownership is manual and the caller
-	// (MetalLayerHandle) releases the returned layer in its destructor. childView.layer is a +0
-	// reference owned by the view, so returning it as-is made that release one too many: it freed
-	// the layer while childView still pointed at it, and AppKit then messaged the freed layer when
-	// the window was torn down (EXC_BAD_ACCESS in objc_msgSend via -[NSView _setHidden:], on both
-	// game stop and app quit). Hand back a +1 instead, and drop our reference to childView now
-	// that the superview owns it - previously that +1 was never released either, so the view leaked.
+	// Non-ARC: the caller (MetalLayerHandle) releases the returned layer in its destructor, so hand
+	// back a +1 - childView.layer is a +0 reference the view still uses. Our own reference to
+	// childView is dropped now that the superview holds it
 	void* layer = (void*)[childView.layer retain];
 	[childView release];
 	return layer;
+}
+
+void DestroyMetalLayer(void* childView)
+{
+	if (!childView)
+		return;
+	NSView* view = (NSView*)childView;
+	if ([NSThread isMainThread])
+	{
+		[view removeFromSuperview];
+		return;
+	}
+	// The renderer can be destroyed on the Latte thread (ShutdownTitle joins it before the canvas is
+	// destroyed). AppKit is main-thread only, so hand the removal over - asynchronously, because the
+	// main thread may be blocked joining this thread
+	[view retain];
+	dispatch_async(dispatch_get_main_queue(), ^{
+		[view removeFromSuperview];
+		[view release];
+	});
+}
+
+void GetMetalViewScale(void* childView, float& scaleX, float& scaleY)
+{
+	NSView* view = (NSView*)childView;
+	const NSRect points = [view frame];
+	const NSRect pixels = [view convertRectToBacking:points];
+	scaleX = (points.size.width > 0.0) ? (float)(pixels.size.width / points.size.width) : 1.0f;
+	scaleY = (points.size.height > 0.0) ? (float)(pixels.size.height / points.size.height) : 1.0f;
 }

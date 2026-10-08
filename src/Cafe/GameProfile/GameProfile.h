@@ -30,7 +30,6 @@ public:
 	[[nodiscard]] const std::optional<GraphicAPI>& GetGraphicsAPI() const { return m_graphics_api; }
 	[[nodiscard]] const AccurateShaderMulOption& GetAccurateShaderMul() const { return m_accurateShaderMul; }
 #ifdef ENABLE_METAL
-	[[nodiscard]] bool GetShaderFastMath() const { return m_shaderFastMath; }
 	[[nodiscard]] MetalBufferCacheMode GetBufferCacheMode() const { return m_metalBufferCacheMode; }
 	[[nodiscard]] PositionInvariance GetPositionInvariance() const { return m_positionInvariance; }
 #endif
@@ -58,7 +57,6 @@ private:
 	std::optional<GraphicAPI> m_graphics_api{};
 	AccurateShaderMulOption m_accurateShaderMul = AccurateShaderMulOption::True;
 #ifdef ENABLE_METAL
-	bool m_shaderFastMath = true;
 	MetalBufferCacheMode m_metalBufferCacheMode = MetalBufferCacheMode::Auto;
 	PositionInvariance m_positionInvariance = PositionInvariance::Auto;
 #endif

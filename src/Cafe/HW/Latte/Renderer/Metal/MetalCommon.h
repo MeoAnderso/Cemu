@@ -5,13 +5,9 @@
 
 #include "Cafe/HW/Latte/Core/LatteConst.h"
 
-// Comment emitted at the top of every MSL source the decompiler produces, and required by anything
-// that rewrites that source text before compiling it (RendererShaderMtl::GetStrippedVariant).
-// That transformation understands the shape the decompiler emits - the FragmentOut struct, the
-// "FragmentOut out;" local, the return statement - none of which exist in a translated graphic-pack
-// shader (SPIRV-Cross output: main0_out, other declaration syntax). Without this marker the stripper
-// removes members from a struct it does not own and rewrites the return of a function it did not
-// convert to void, producing a source that cannot compile; with it, the stripper refuses instead
+// Comment emitted at the top of every MSL source the decompiler produces. Text rewrites
+// (RendererShaderMtl::GetStrippedVariant) require it: they rely on the decompiler's shape (FragmentOut,
+// "FragmentOut out;", the return), which translated pack shaders don't have, so without it they refuse
 constexpr const char* kMslDecompilerSourceMarker = "// cemu-decompiler-msl";
 
 struct MetalPixelFormatSupport
@@ -113,87 +109,10 @@ inline bool FormatIsRenderable(Latte::E_GX2SURFFMT format)
     return !Latte::IsCompressedFormat(format);
 }
 
-template <typename... T>
-inline bool executeCommand(fmt::format_string<T...> fmt, T&&... args) {
-    std::string command = fmt::format(fmt, std::forward<T>(args)...);
-    int res = system(command.c_str());
-    if (res != 0)
-    {
-        cemuLog_log(LogType::Force, "command \"{}\" failed with exit code {}", command, res);
-        return false;
-    }
-
-    return true;
-}
-
-/*
-class MemoryMappedFile
-{
-public:
-    MemoryMappedFile(const std::string& filePath)
-    {
-        // Open the file
-        m_fd = open(filePath.c_str(), O_RDONLY);
-        if (m_fd == -1) {
-            cemuLog_log(LogType::Force, "failed to open file: {}", filePath);
-            return;
-        }
-
-        // Get the file size
-        // Use a loop to handle the case where the file size is 0 (more of a safety net)
-        struct stat fileStat;
-        while (true)
-        {
-            if (fstat(m_fd, &fileStat) == -1)
-            {
-                close(m_fd);
-                cemuLog_log(LogType::Force, "failed to get file size: {}", filePath);
-                return;
-            }
-            m_fileSize = fileStat.st_size;
-
-            if (m_fileSize == 0)
-            {
-                cemuLog_logOnce(LogType::Force, "file size is 0: {}", filePath);
-                std::this_thread::sleep_for(std::chrono::milliseconds(10));
-                continue;
-            }
-
-            break;
-        }
-
-        // Memory map the file
-        m_data = mmap(nullptr, m_fileSize, PROT_READ, MAP_PRIVATE, m_fd, 0);
-        if (m_data == MAP_FAILED)
-        {
-            close(m_fd);
-            cemuLog_log(LogType::Force, "failed to memory map file: {}", filePath);
-            return;
-        }
-    }
-
-    ~MemoryMappedFile()
-    {
-        if (m_data && m_data != MAP_FAILED)
-            munmap(m_data, m_fileSize);
-
-        if (m_fd != -1)
-            close(m_fd);
-    }
-
-    uint8* data() const { return static_cast<uint8*>(m_data); }
-    size_t size() const { return m_fileSize; }
-
-private:
-    int m_fd = -1;
-    void* m_data = nullptr;
-    size_t m_fileSize = 0;
-};
-*/
 
 // Number of vertices per input primitive as consumed by the mesh path. LatteIndices_decode
 // rewrites some primitive modes before they reach the mesh shaders (QUADS/QUAD_STRIP become
-// triangle lists, TRIANGLE_FAN becomes a triangle strip, LINE_LOOP becomes a reconnecting line
+// triangle lists, TRIANGLE_FAN becomes a triangle list, LINE_LOOP becomes a reconnecting line
 // strip) - the counts below describe the rewritten data, not the guest primitive
 inline uint32 GetVerticesPerPrimitive(LattePrimitiveMode primitiveMode)
 {
@@ -221,12 +140,11 @@ inline uint32 GetVerticesPerPrimitive(LattePrimitiveMode primitiveMode)
 }
 
 // Strip modes are consumed as connected primitives (one vertex of overlap between consecutive
-// primitives). TRIANGLE_FAN is consumed like a strip because the index decoder rewrites it into
-// a triangle strip
+// primitives)
 inline bool PrimitiveRequiresConnection(LattePrimitiveMode primitiveMode)
 {
     if (primitiveMode == LattePrimitiveMode::LINE_STRIP || primitiveMode == LattePrimitiveMode::LINE_LOOP ||
-        primitiveMode == LattePrimitiveMode::TRIANGLE_STRIP || primitiveMode == LattePrimitiveMode::TRIANGLE_FAN)
+        primitiveMode == LattePrimitiveMode::TRIANGLE_STRIP)
         return true;
     else
         return false;

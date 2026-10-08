@@ -525,9 +525,8 @@ namespace LatteDecompiler
 		decompilerContext->output->resourceMappingMTL.textureUnitBaseBindingPoint = decompilerContext->currentTextureBindingPointMTL;
 		// textures that are accessed via a framebuffer fetch read the attachment directly and need
 		// no texture binding. When framebuffer fetch is unavailable the unit is sampled as a regular
-		// texture instead (served from a shadow copy of the attachment by the renderer) and needs a
-		// normal binding - skipping it here left the binding at -1, which the MSL emitter rendered
-		// as [[texture(4294967295)]] and the shader failed to compile.
+		// texture instead (served from a shadow copy of the attachment by the renderer), so it needs
+		// a binding.
 		// Note: this runs for every backend on builds where ENABLE_METAL is compiled in, so the
 		// renderer type must be checked before the downcast (dual-backend macOS builds)
 		const bool usesFramebufferFetch = g_renderer->GetType() == RendererAPI::Metal &&
@@ -564,10 +563,7 @@ namespace LatteDecompiler
 		if (g_renderer->GetType() == RendererAPI::Metal &&
 			decompilerContext->output->resourceMappingMTL.textureUnitCount > MAX_MTL_SAMPLERS)
 		{
-			// shaderBaseHash, not shader->baseHash: the shader's own hashes are assigned by
-			// LatteShader_CreateShaderFromDecompilerOutput once the decompiler has returned, so at
-			// this point they are still 0 - reading them named every shader 0000000000000000_... and,
-			// since the latch is keyed on the same value, collapsed the detail line to once a session
+			// shaderBaseHash: shader->baseHash isn't assigned yet while the analyzer runs
 			MetalDiag_CountOncePer(MetalDiagEvent::SamplerBindingOverflow, (uintptr_t)decompilerContext->shaderBaseHash,
 				"shader {:016x} declares {} textures/samplers - Metal's sampler table holds {} per stage, so the decompiled shader has no valid encoding (a graphic pack replacement is translated separately and may still compile)",
 				decompilerContext->shaderBaseHash,

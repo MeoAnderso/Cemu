@@ -115,8 +115,6 @@ struct MetalState
 {
     MetalEncoderState m_encoderState{};
 
-    bool m_usesSRGB = false;
-
     bool m_skipDrawSequence = false;
     bool m_isFirstDrawInRenderPass = true;
 
@@ -201,6 +199,11 @@ public:
 									bool padView, bool clearBackground) override;
 	bool BeginFrame(bool mainWindow) override;
 
+	// Called from the GUI thread before the pad window (and with it this renderer's pad layer) is
+	// destroyed. Wakes the render thread out of a pad frame and waits for it to stop acquiring
+	// drawables from that layer - without it, closing the DRC window mid-game races the render thread
+	void StopUsingPadAndWait();
+
 	// flush control
 	void Flush(bool waitIdle = false) override;		// called when explicit flush is required (e.g. by imgui)
 	void NotifyLatteCommandProcessorIdle() override; // called when command processor has no more commands available or when stalled
@@ -274,6 +277,14 @@ public:
 	// PrepareFeedbackLoopShadowCopies so feedback shadow copies pick up the regenerated levels
 	void EnsureSampledMipContentValid(class LatteDecompilerShader* vertexShader, class LatteDecompilerShader* geometryShader, class LatteDecompilerShader* pixelShader);
 
+	// Records that the active pass wrote its attachments, at the level each attachment is bound at.
+	// Called immediately before a draw is issued, not when the pass is created: a pass that is
+	// opened and then abandoned - a permanently failed pipeline returns before the draw - wrote
+	// nothing, and recording it would disarm the sample-time clamp on a level nothing wrote and
+	// permanently disable regeneration for the chain (a pass on an upper mip counts as provenance
+	// in EnsureSampledMipContentValid's gate)
+	void MarkPassAttachmentsWritten();
+
 	struct FeedbackShadowCopy
 	{
 		MTL::Texture* texture = nullptr;
@@ -287,7 +298,7 @@ public:
 		// Owned by this struct: released on destruction and whenever the shadow texture is replaced
 		std::unordered_map<LatteMtlSampleViewKey, MTL::Texture*> sampleViews;
 
-		~FeedbackShadowCopy() { releaseSampleViews(); }
+		~FeedbackShadowCopy() { releaseSampleViews(); if (texture) texture->release(); }
 
 		// non-copyable: members own ObjC references, a copy would double-release
 		FeedbackShadowCopy() = default;
@@ -309,6 +320,10 @@ public:
 		{
 			if (this != &other)
 			{
+				// this object's own texture has to be released, not just its sample views - the
+				// assignment below overwrites the pointer
+				if (texture)
+					texture->release();
 				releaseSampleViews();
 				texture = other.texture;
 				other.texture = nullptr;
@@ -467,11 +482,13 @@ public:
         return m_supportsFramebufferFetch;
     }
 
-    // a GPU-capture/frame-debugger session is active (Xcode sets METAL_CAPTURE_ENABLED) -
-    // async-compiled draws are disabled in that case (Vulkan parity: IsTracingToolEnabled)
+    // A GPU-capture/frame-debugger session is active - either Xcode driving one (it sets
+    // METAL_CAPTURE_ENABLED) or the in-app capture started by Debug -> GPU capture. Async-compiled
+    // draws are disabled in that case (Vulkan parity), or they would be missing from the capture,
+    // and the pass/command-buffer labels are emitted, which is what makes the trace navigable
     bool IsTracingToolEnabled() const
     {
-        return m_usingTracingTool;
+        return m_usingTracingTool || m_capturing;
     }
 
     bool HasUnifiedMemory() const
@@ -517,6 +534,10 @@ public:
         return m_readbackBuffer;
     }
 
+    // the pipeline cache also owns the MTLBinaryArchive (see MetalPipelineCache::GetBinaryArchiveLookupArray);
+    // the pipeline compiler needs it to look pipelines up and add newly compiled ones
+    class MetalPipelineCache* GetPipelineCache() const { return m_pipelineCache; }
+
     MTL::Buffer* GetXfbRingBuffer()
     {
         if (!m_xfbRingBuffer)
@@ -546,6 +567,13 @@ public:
         return m_occlusionQuery.m_currentIndex;
     }
 
+    // Monotonic count of the slots consumed by counted draws. Unlike the index (which rolls), this
+    // cannot be confused by a wrap: a query that consumed exactly the pool size has begin == end
+    uint64 GetOcclusionQueryDrawCount() const
+    {
+        return m_occlusionQuery.m_countedDraws;
+    }
+
     void BeginOcclusionQuery()
     {
         m_occlusionQuery.m_active = true;
@@ -569,6 +597,16 @@ public:
 private:
 	MetalLayerHandle m_mainLayer;
 	MetalLayerHandle m_padLayer;
+
+	// pad teardown handshake, see StopUsingPadAndWait. Requested is set while no pad layer may be used:
+	// from construction until InitializeLayer(false), and again from StopUsingPadAndWait. InProgress spans
+	// one pad frame (see AcquireDrawable) and is waited on (with the mutex/condvar) so the layer is not
+	// freed under a live drawable
+	std::atomic_flag m_padLayerStopRequested{};
+	std::atomic_bool m_padFrameInProgress{ false };
+	std::mutex m_padLayerStopMutex;
+	std::condition_variable m_padLayerStopCondVar;
+	void EndPadFrame();
 
 	MetalPerformanceMonitor m_performanceMonitor;
 
@@ -653,6 +691,8 @@ private:
 	MTL::Buffer* m_textureCopyStagingBuffer = nullptr;
 	// dummy binding for the object shader's always-declared indexBuffer on non-indexed mesh draws
 	MTL::Buffer* m_meshIndexDummyBuffer = nullptr;
+	// zero-filled stand-in bound by SetBuffer for empty ranges (created on first use)
+	MTL::Buffer* m_emptyBuffer = nullptr;
 
 	// Transform feedback
 	MTL::Buffer* m_xfbRingBuffer = nullptr;
@@ -663,6 +703,8 @@ private:
     	MTL::Buffer* m_resultBuffer;
     	uint64* m_resultsPtr;
     	uint32 m_currentIndex = 0;
+    	// slots consumed since startup - see GetOcclusionQueryDrawCount
+    	uint64 m_countedDraws = 0;
         bool m_active = false;
         MTL::CommandBuffer* m_lastCommandBuffer = nullptr;
 	} m_occlusionQuery;
@@ -681,8 +723,10 @@ private:
 	MetalState m_state;
 
 	// GPU capture
-	bool m_captureFrame = false;
-	bool m_capturing = false;
+	// both are written from the GUI thread (CaptureFrame, StartCapture) and read on the render thread
+	// in SwapBuffers, so they are atomics rather than plain bools
+	std::atomic_bool m_captureFrame{ false };
+	std::atomic_bool m_capturing{ false };
 
 	// Helpers
 	MetalLayerHandle& GetLayer(bool mainWindow)

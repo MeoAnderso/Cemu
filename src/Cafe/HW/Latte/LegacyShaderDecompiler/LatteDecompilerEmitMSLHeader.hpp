@@ -22,44 +22,49 @@ namespace LatteDecompiler
 		const std::vector<SupportBufferFieldLayout> fields = ComputeSupportBufferLayout(decompilerContext, true, uniformOffsets);
 		for (const auto& field : fields)
 		{
+			// the declared type comes from the shared table, so this asserts the size of the
+			// declaration this emitter is about to produce against the byte size the layout recorded
+			const SupportBufferFieldType type = GetSupportBufferFieldType(field.kind, true);
+			cemu_assert_debug(GetSupportBufferFieldTypeSize(field, type) == field.size);
+			const std::string typeText = GetSupportBufferFieldTypeMSL(type);
 			switch (field.kind)
 			{
 			case SupportBufferFieldLayout::Kind::RemappedUniforms:
 				// uniform registers or buffers are accessed statically with predictable offsets
 				// this allows us to remap the used entries into a more compact array
-				src->addFmt("int4 remapped[{}];" _CRLF, field.arrayCount);
+				src->addFmt("{} remapped[{}];" _CRLF, typeText, field.arrayCount);
 				break;
 			case SupportBufferFieldLayout::Kind::UniformRegisterFile:
 				// full or partial uniform register file has to be present
-				src->addFmt("int4 uniformRegister[{}];" _CRLF, field.arrayCount);
+				src->addFmt("{} uniformRegister[{}];" _CRLF, typeText, field.arrayCount);
 				break;
 			case SupportBufferFieldLayout::Kind::WindowSpaceToClipSpaceTransform:
-				src->add("float2 windowSpaceToClipSpaceTransform;" _CRLF);
+				src->addFmt("{} windowSpaceToClipSpaceTransform;" _CRLF, typeText);
 				break;
 			case SupportBufferFieldLayout::Kind::AlphaTestRef:
-				src->add("float alphaTestRef;" _CRLF);
+				src->addFmt("{} alphaTestRef;" _CRLF, typeText);
 				break;
 			case SupportBufferFieldLayout::Kind::PointSize:
-				src->add("float pointSize;" _CRLF);
+				src->addFmt("{} pointSize;" _CRLF, typeText);
 				break;
 			case SupportBufferFieldLayout::Kind::FragCoordScale:
 				// vec4 with the render target origin in zw, matching the Vulkan ufBlock layout that
 				// translated graphic pack shaders are authored against. LatteMRT::GetCurrentFragCoordScale
 				// also always writes 4 floats, so a float2 here would clobber the next 8 bytes
-				src->add("float4 fragCoordScale;" _CRLF);
+				src->addFmt("{} fragCoordScale;" _CRLF, typeText);
 				break;
 			case SupportBufferFieldLayout::Kind::FragCoordScaleCompatPadding:
-				src->add("float4 fragCoordScaleCompatPadding;" _CRLF);
+				src->addFmt("{} fragCoordScaleCompatPadding;" _CRLF, typeText);
 				break;
 			case SupportBufferFieldLayout::Kind::TexScale:
-				src->addFmt("float2 tex{}Scale;" _CRLF, field.texUnit);
+				src->addFmt("{} tex{}Scale;" _CRLF, typeText, field.texUnit);
 				break;
 			case SupportBufferFieldLayout::Kind::VerticesPerInstance:
 				// the mesh path gets its vertex count via a dedicated buffer binding instead (see emitInputs)
-				src->add("int verticesPerInstance;" _CRLF);
+				src->addFmt("{} verticesPerInstance;" _CRLF, typeText);
 				break;
 			case SupportBufferFieldLayout::Kind::StreamoutBufferBase:
-				src->addFmt("int streamoutBufferBase{};" _CRLF, field.streamoutIndex);
+				src->addFmt("{} streamoutBufferBase{};" _CRLF, typeText, field.streamoutIndex);
 				break;
 			}
 		}
@@ -299,6 +304,10 @@ namespace LatteDecompiler
 
                 src->add("struct GeometryOut {" _CRLF);
                 src->add("float4 position [[position]];" _CRLF);
+                // a point geometry shader never writes gl_PointSize itself (only the vertex stage
+                // exports it), so the mesh path needs the member the emit-vertex code assigns
+                if (decompilerContext->analyzer.outputPointSize)
+                    src->add("float pointSize [[point_size]];" _CRLF);
     			for (sint32 p = 0; p < decompilerContext->parsedGSCopyShader->numParam; p++)
     			{
     				if (decompilerContext->parsedGSCopyShader->paramMapping[p].exportType != 2)
@@ -440,18 +449,24 @@ namespace LatteDecompiler
     				cemu_assert_unimplemented();
     			}
 
-    			// The sampler index is the texture binding, and deliberately so: the analyzer assigns
-    			// those densely over the units that declare a texture, so they are unique, and Metal
-    			// rejects a function in which two sampler arguments claim the same [[sampler(n)]]
-    			// index. (Remapping units onto shared slots per sampler *state* - the shape upstream
-    			// #2035 proposed - fails exactly there: it produces duplicate indices and Metal
-    			// refuses to reserve the location.) Textures and samplers are separate argument
-    			// tables, so reusing the number is fine. What is not fine is the sampler table being
-    			// the smaller of the two, 16 against 31: a shader declaring more than 16 is reported
-    			// by _initTextureBindingPointsMTL, and cannot compile
+    			// The sampler index is the texture binding: the analyzer assigns those densely, so they
+    			// are unique per function as Metal requires (separate argument tables, so the shared
+    			// number is fine). The sampler table holds 16 against 31 textures: a shader declaring
+    			// more than 16 is reported by _initTextureBindingPointsMTL, and cannot compile
     			uint32 binding = shaderContext->output->resourceMappingMTL.textureUnitToBindingPoint[i];
     			src->addFmt(" tex{} [[texture({})]]", i, binding);
     			src->addFmt(", sampler samplr{} [[sampler({})]]", i, binding);
+			}
+		}
+
+		// render target sizes for RESINFO on framebuffer-fetch units (a colN input is a plain value
+		// with nothing to query), bound by BindStageResources. Fetch units only exist in pixel shaders
+		for (sint32 i = 0; i < LATTE_NUM_COLOR_TARGET; i++)
+		{
+			if (renderTargetIndexUsed[i])
+			{
+				src->addFmt(", constant uint2* fetchTargetSizes [[buffer({})]]", GET_HELPER_BUFFER_BINDING(0));
+				break;
 			}
 		}
 	}

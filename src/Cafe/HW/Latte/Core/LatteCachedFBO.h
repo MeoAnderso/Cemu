@@ -116,6 +116,24 @@ class LatteMRT
 public:
 	static void NotifyTextureDeletion(LatteTexture* texture);
 
+	// Address/dimension decoding of one color buffer register set, with no side effects: no view is
+	// looked up or created. GetColorAttachmentTexture uses it, and so does the Metal backend's
+	// read-only framebuffer-fetch check (LatteShader.cpp) - the two used to carry separate copies of
+	// this derivation, which could drift apart silently
+	struct ColorBufferViewDecode
+	{
+		MPTR physAddress;
+		uint32 width;
+		uint32 height;
+		uint32 pitch;
+		uint32 firstSlice;
+		uint32 numSlices;
+		uint32 swizzle;
+		Latte::E_HWTILEMODE tileMode;
+		Latte::E_GX2SURFFMT format;
+	};
+	static ColorBufferViewDecode DecodeColorBufferView(uint32 index, const uint32* contextRegisters, const LatteContextRegister& lcr);
+
 	// GPU state
 	static LatteTextureView* GetColorAttachmentTexture(uint32 index, bool createNew, bool checkForTextureChanges);
 	static uint8 GetActiveColorBufferMask(const LatteDecompilerShader* pixelShader, const struct LatteContextRegister& lcr);

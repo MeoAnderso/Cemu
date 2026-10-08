@@ -174,9 +174,10 @@ void RendererShaderVk::CompileInternal(bool isRenderThread)
 		}
 	}
 
-	// compile GLSL to SPIR-V via the shared SpirvCompiler front-end
+	// compile GLSL to SPIR-V via the shared SpirvCompiler front-end. assertOnFailure: a failure here
+	// means a shader this backend needed could not be built, so keep breaking into the debugger
 	std::vector<uint32> spirvBuffer;
-	if (!SpirvCompiler_Compile(m_glslCode, GetType(), m_baseHash, m_auxHash, compileWithDebugInfo, spirvBuffer))
+	if (!SpirvCompiler_Compile(m_glslCode, GetType(), m_baseHash, m_auxHash, compileWithDebugInfo, spirvBuffer, true))
 	{
 		FinishCompilation();
 		return;

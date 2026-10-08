@@ -4,21 +4,13 @@
 #include "Cafe/HW/Latte/Renderer/Metal/MetalShaderTranslator.h"
 #include "Cafe/HW/Latte/Renderer/Metal/MetalDiagnostics.h"
 
-//#include "Cemu/FileCache/FileCache.h"
-//#include "config/ActiveSettings.h"
 #include "Cemu/Logging/CemuLogging.h"
 #include "Common/precompiled.h"
 #include "GameProfile/GameProfile.h"
 #include "util/helpers/helpers.h"
 
-#define METAL_AIR_CACHE_NAME "Cemu_AIR_cache"
-#define METAL_AIR_CACHE_PATH "/Volumes/" METAL_AIR_CACHE_NAME
-#define METAL_AIR_CACHE_SIZE (16 * 1024 * 1024)
-#define METAL_AIR_CACHE_BLOCK_COUNT (METAL_AIR_CACHE_SIZE / 512)
 
 static bool s_isLoadingShadersMtl{false};
-//static bool s_hasRAMFilesystem{false};
-//class FileCache* s_airCache{nullptr};
 
 extern std::atomic_int g_compiled_shaders_total;
 extern std::atomic_int g_compiled_shaders_async;
@@ -36,21 +28,6 @@ public:
 		for (uint32 i = 0; i < threadCount; ++i)
 			s_threads.emplace_back(&ShaderMtlThreadPool::CompilerThreadFunc, this);
 
-		// Create AIR cache thread
-		/*
-	    s_airCacheThread = new std::thread(&ShaderMtlThreadPool::AIRCacheThreadFunc, this);
-
-		// Set priority
-		sched_param schedParam;
-        schedParam.sched_priority = 20;
-        if (pthread_setschedparam(s_airCacheThread->native_handle(), SCHED_FIFO, &schedParam) != 0) {
-            cemuLog_log(LogType::Force, "failed to set FIFO thread priority");
-        }
-
-        if (pthread_setschedparam(s_airCacheThread->native_handle(), SCHED_RR, &schedParam) != 0) {
-            cemuLog_log(LogType::Force, "failed to set RR thread priority");
-        }
-        */
 	}
 
 	void StopThreads()
@@ -63,14 +40,6 @@ public:
 			it.join();
 		s_threads.clear();
 
-		/*
-		if (s_airCacheThread)
-		{
-            s_airCacheQueueCount.increment();
-    		s_airCacheThread->join();
-    		delete s_airCacheThread;
-		}
-		*/
 	}
 
 	~ShaderMtlThreadPool()
@@ -107,75 +76,26 @@ public:
 		}
 	}
 
-	/*
-	void AIRCacheThreadFunc()
-    {
-        SetThreadName("mtlAIRCache");
-        while (m_threadsActive.load(std::memory_order::relaxed))
-        {
-            s_airCacheQueueCount.decrementWithWait();
-            s_airCacheQueueMutex.lock();
-            if (s_airCacheQueue.empty())
-            {
-                s_airCacheQueueMutex.unlock();
-                continue;
-            }
-
-            // Create RAM filesystem
-            if (!s_hasRAMFilesystem)
-            {
-                executeCommand("diskutil erasevolume HFS+ {} $(hdiutil attach -nomount ram://{})", METAL_AIR_CACHE_NAME, METAL_AIR_CACHE_BLOCK_COUNT);
-                s_hasRAMFilesystem = true;
-            }
-
-            RendererShaderMtl* job = s_airCacheQueue.front();
-            s_airCacheQueue.pop_front();
-            s_airCacheQueueMutex.unlock();
-            // compile
-            job->CompileToAIR();
-        }
-    }
-    */
 
 	bool HasThreadsRunning() const { return m_threadsActive; }
 
 public:
 	std::vector<std::thread> s_threads;
-	//std::thread* s_airCacheThread{nullptr};
 
 	std::deque<RendererShaderMtl*> s_compilationQueue;
 	CounterSemaphore s_compilationQueueCount;
 	std::mutex s_compilationQueueMutex;
 
-	/*
-	std::deque<RendererShaderMtl*> s_airCacheQueue;
-	CounterSemaphore s_airCacheQueueCount;
-	std::mutex s_airCacheQueueMutex;
-	*/
 
 private:
 	std::atomic<bool> m_threadsActive;
 } shaderMtlThreadPool;
 
-// TODO: find out if it would be possible to cache compiled Metal shaders
+// Compiled shaders are cached by the renderer: the pipeline binary archive (see
+// MetalPipelineCache::GetBinaryArchiveLookupArray) keeps the compiled functions across launches
 void RendererShaderMtl::ShaderCacheLoading_begin(uint64 cacheTitleId)
 {
     s_isLoadingShadersMtl = true;
-
-    // Open AIR cache
-    /*
-    if (s_airCache)
-	{
-		delete s_airCache;
-		s_airCache = nullptr;
-	}
-	uint32 airCacheMagic = GeneratePrecompiledCacheId();
-	const std::string cacheFilename = fmt::format("{:016x}_air.bin", cacheTitleId);
-	const fs::path cachePath = ActiveSettings::GetCachePath("shaderCache/precompiled/{}", cacheFilename);
-	s_airCache = FileCache::Open(cachePath, true, airCacheMagic);
-	if (!s_airCache)
-		cemuLog_log(LogType::Force, "Unable to open AIR cache {}", cacheFilename);
-	*/
 
     // Maximize shader compilation speed
     static_cast<MetalRenderer*>(g_renderer.get())->SetShouldMaximizeConcurrentCompilation(true);
@@ -195,18 +115,6 @@ void RendererShaderMtl::ShaderCacheLoading_Close()
 	// closing s_spirvCache here)
 	MetalShaderTranslator_CloseCache();
 
-    // Close the AIR cache
-    /*
-    if (s_airCache)
-    {
-        delete s_airCache;
-        s_airCache = nullptr;
-    }
-
-    // Close RAM filesystem
-    if (s_hasRAMFilesystem)
-        executeCommand("diskutil eject {}", METAL_AIR_CACHE_PATH);
-    */
 }
 
 void RendererShaderMtl::Initialize()
@@ -290,94 +198,57 @@ bool RendererShaderMtl::ShouldCountCompilation() const
     return !s_isLoadingShadersMtl && m_isGameShader;
 }
 
-MTL::Library* RendererShaderMtl::LibraryFromSource()
+MTL::CompileOptions* RendererShaderMtl::NewCompileOptions(MetalRenderer* mtlr)
 {
-    // Compile from source
-    NS_STACK_SCOPED MTL::CompileOptions* options = MTL::CompileOptions::alloc()->init();
-    // Fast-math must stay off: Metal's CompileOptions default to fast-math enabled, but the
-    // Vulkan reference path (GLSL -> SPIR-V) preserves FMul/FAdd order and rounding. Fast-math
-    // reassociates float expressions, contracts a*b+c and approximates 1.0/x (the decompiler
-    // emits RECIP_IEEE verbatim), which shifts low-order bits per pixel and visibly diverges in
-    // effect chains (DoF/bloom dither). It can also legally simplify the a==0.0 || b==0.0 guard
-    // the mul_nonIEEE emulation relies on.
-    // Note: the shaderFastMath game-profile option is intentionally NOT honored here. No other
-    // backend consumes it (SPIR-V preserves IEEE semantics unconditionally) and it defaults to
-    // true, so honoring it would disable exactly the IEEE parity this line enforces. If the
-    // option is ever wired into the Vulkan path, revisit
+    MTL::CompileOptions* options = MTL::CompileOptions::alloc()->init();
+    // Fast math stays off (Metal defaults it on): it reassociates and contracts float expressions,
+    // approximates 1.0/x (RECIP_IEEE is emitted verbatim), and may fold the a==0.0 || b==0.0 guard
+    // the mul_nonIEEE emulation relies on
     options->setFastMathEnabled(false);
+    // Pinned rather than left to the toolchain default: the rect/geometry emulation shaders use MSL 3.0
+    // features ([[mesh]], mesh<>), which only compile at language version 3.0 or later
+    options->setLanguageVersion(MTL::LanguageVersion3_0);
 
-    if (m_mtlr->GetPositionInvariance())
+    if (mtlr->GetPositionInvariance())
     {
         // TODO: filter out based on GPU state
         options->setPreserveInvariance(true);
     }
+    return options;
+}
 
+MTL::Library* RendererShaderMtl::LibraryFromSource()
+{
+    // Compile from source
+    NS_STACK_SCOPED MTL::CompileOptions* options = RendererShaderMtl::NewCompileOptions(m_mtlr);
+
+    // the out-param error is autoreleased (metal-cpp does not retain it) - do not release it. Metal
+    // also fills it with warnings when the compilation succeeded, so only a missing library is a failure
     NS::Error* error = nullptr;
 	MTL::Library* library = m_mtlr->GetDevice()->newLibrary(ToNSString(m_mslCode), options, &error);
-	if (error)
+	if (!library)
     {
-        cemuLog_log(LogType::Force, "failed to create library from source: {} -> {}", error->localizedDescription()->utf8String(), m_mslCode.c_str());
+        cemuLog_log(LogType::Force, "failed to create library from source: {} -> {}", error ? error->localizedDescription()->utf8String() : "unknown error", m_mslCode.c_str());
         m_hasError = true;
         return nullptr;
     }
+    if (error && cemuLog_isLoggingEnabled(LogType::MetalBackend))
+        cemuLog_log(LogType::MetalBackend, "shader {:016x}_{:016x} compiled with warnings: {}", m_baseHash, m_auxHash, error->localizedDescription()->utf8String());
 
     return library;
 }
 
-/*
-MTL::Library* RendererShaderMtl::LibraryFromAIR(std::span<uint8> data)
-{
-    dispatch_data_t dispatchData = dispatch_data_create(data.data(), data.size(), nullptr, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
-
-    NS::Error* error = nullptr;
-	MTL::Library* library = m_mtlr->GetDevice()->newLibrary(dispatchData, &error);
-	if (error)
-    {
-        cemuLog_log(LogType::Force, "failed to create library from AIR: {}", error->localizedDescription()->utf8String());
-        return nullptr;
-    }
-
-    return library;
-}
-*/
 
 void RendererShaderMtl::CompileInternal()
 {
-    MTL::Library* library = nullptr;
+    // runs on the shader-compile threads (and synchronously via PreponeCompilation), which have no
+    // autorelease pool: drain what compilation autoreleases (the source NSString, NSError) per shader
+    NS_STACK_SCOPED NS::AutoreleasePool* autoreleasePool = NS::AutoreleasePool::alloc()->init();
 
-    // First, try to retrieve the compiled shader from the AIR cache
-    /*
-    if (s_isLoadingShadersMtl && (m_isGameShader && !m_isGfxPackShader) && s_airCache)
-    {
-        cemu_assert_debug(m_baseHash != 0);
-		uint64 h1, h2;
-		GenerateShaderPrecompiledCacheFilename(m_type, m_baseHash, m_auxHash, h1, h2);
-		std::vector<uint8> cacheFileData;
-		if (s_airCache->GetFile({ h1, h2 }, cacheFileData))
-		{
-			library = LibraryFromAIR(std::span<uint8>(cacheFileData.data(), cacheFileData.size()));
-			FinishCompilation();
-		}
-    }
-    */
-
-    // Not in the cache, compile from source
+    MTL::Library* library = LibraryFromSource();
+    FinishCompilation();
     if (!library)
-    {
-        // Compile from source
-        library = LibraryFromSource();
-        FinishCompilation();
-        if (!library)
-            return;
-
-        // Store in the AIR cache
-        /*
-        shaderMtlThreadPool.s_airCacheQueueMutex.lock();
-        shaderMtlThreadPool.s_airCacheQueue.push_back(this);
-        shaderMtlThreadPool.s_airCacheQueueCount.increment();
-        shaderMtlThreadPool.s_airCacheQueueMutex.unlock();
-        */
-    }
+        return;
 
     m_function = library->newFunction(ToNSString("main0"));
     if (!m_function)
@@ -389,45 +260,6 @@ void RendererShaderMtl::CompileInternal()
 	    g_compiled_shaders_total++;
 }
 
-/*
-void RendererShaderMtl::CompileToAIR()
-{
-    uint64 h1, h2;
-	GenerateShaderPrecompiledCacheFilename(m_type, m_baseHash, m_auxHash, h1, h2);
-
-    // The shader is not in the cache, compile it
-	std::string baseFilename = fmt::format("{}/{}_{}", METAL_AIR_CACHE_PATH, h1, h2);
-
-	// Source
-	std::ofstream mslFile;
-    mslFile.open(fmt::format("{}.metal", baseFilename));
-    mslFile << m_mslCode;
-    mslFile.close();
-
-    // Compile
-	if (!executeCommand("xcrun -sdk macosx metal -o {}.ir -c {}.metal -w", baseFilename, baseFilename))
-	    return;
-	if (!executeCommand("xcrun -sdk macosx metallib -o {}.metallib {}.ir", baseFilename, baseFilename))
-        return;
-
-	// Clean up
-	executeCommand("rm {}.metal", baseFilename);
-	executeCommand("rm {}.ir", baseFilename);
-
-	// Load from the newly generated AIR
-	MemoryMappedFile airFile(fmt::format("{}.metallib", baseFilename));
-	std::span<uint8> airData = std::span<uint8>(airFile.data(), airFile.size());
-	//library = LibraryFromAIR(std::span<uint8>(airData.data(), airData.size()));
-
-	// Store in the cache
-	s_airCache->AddFile({ h1, h2 }, airData.data(), airData.size());
-
-	// Clean up
-	executeCommand("rm {}.metallib", baseFilename);
-
-	FinishCompilation();
-}
-*/
 
 MTL::Function* RendererShaderMtl::GetStrippedVariant(uint32 removedColorMask, bool removeDepth)
 {
@@ -569,9 +401,10 @@ MTL::Function* RendererShaderMtl::GetStrippedVariant(uint32 removedColorMask, bo
 			size_t sigPos = patchedSource.find(sigOld);
 			if (sigPos != std::string::npos)
 				patchedSource.replace(sigPos, sigOld.size(), "void main0(");
+			const std::string retOld = "return out;";
 			size_t retPos;
-			while ((retPos = patchedSource.find("return out;")) != std::string::npos)
-				patchedSource.replace(retPos, 10, "return;");
+			while ((retPos = patchedSource.find(retOld)) != std::string::npos)
+				patchedSource.replace(retPos, retOld.size(), "return;");
 		}
 	}
 
@@ -581,11 +414,7 @@ MTL::Function* RendererShaderMtl::GetStrippedVariant(uint32 removedColorMask, bo
 	MTL::Function* function = nullptr;
 	{
 		NS::AutoreleasePool* autoreleasePool = NS::AutoreleasePool::alloc()->init();
-		NS_STACK_SCOPED MTL::CompileOptions* options = MTL::CompileOptions::alloc()->init();
-		// must match LibraryFromSource - fast-math stays off on the Vulkan-parity path
-		options->setFastMathEnabled(false);
-		if (m_mtlr->GetPositionInvariance())
-			options->setPreserveInvariance(true);
+		NS_STACK_SCOPED MTL::CompileOptions* options = RendererShaderMtl::NewCompileOptions(m_mtlr);
 
 		NS::Error* error = nullptr;
 		MTL::Library* library = m_mtlr->GetDevice()->newLibrary(ToNSString(patchedSource), options, &error);

@@ -76,15 +76,17 @@ std::map<Latte::E_GX2SURFFMT, MetalPixelFormatInfo> MTL_COLOR_FORMAT_TABLE = {
 std::map<Latte::E_GX2SURFFMT, MetalPixelFormatInfo> MTL_DEPTH_FORMAT_TABLE = {
     {Latte::E_GX2SURFFMT::INVALID_FORMAT, {MTL::PixelFormatInvalid, MetalDataType::NONE, 0}},
 
+	// bytesPerBlock for the combined depth/stencil formats is the depth aspect alone (4 bytes per
+	// texel), which is what a BlitOptionDepthFromDepthStencil copy moves
 	{Latte::E_GX2SURFFMT::D24_S8_UNORM, {MTL::PixelFormatDepth24Unorm_Stencil8, MetalDataType::NONE, 4, {1, 1}, true}},
 	{Latte::E_GX2SURFFMT::D24_S8_FLOAT, {MTL::PixelFormatDepth32Float_Stencil8, MetalDataType::NONE, 4, {1, 1}, true, nullptr, true}},
-	{Latte::E_GX2SURFFMT::D32_S8_FLOAT, {MTL::PixelFormatDepth32Float_Stencil8, MetalDataType::NONE, 5, {1, 1}, true, nullptr, true}},
+	{Latte::E_GX2SURFFMT::D32_S8_FLOAT, {MTL::PixelFormatDepth32Float_Stencil8, MetalDataType::NONE, 4, {1, 1}, true, nullptr, true}},
 	{Latte::E_GX2SURFFMT::D16_UNORM, {MTL::PixelFormatDepth16Unorm, MetalDataType::NONE, 2, {1, 1}}},
 	{Latte::E_GX2SURFFMT::D32_FLOAT, {MTL::PixelFormatDepth32Float, MetalDataType::NONE, 4, {1, 1}}},
 };
 
-// TODO: R10_G10_B10_A2_UINT and R10_G10_B10_A2_SINT
-// TODO: A2_B10_G10_R10_UNORM and A2_B10_G10_R10_UINT
+// The tables above have rows for every Latte format Metal can describe, but not every one of them
+// has a decoder - those entries are listed at the end of CheckForPixelFormatSupport
 void CheckForPixelFormatSupport(const MetalPixelFormatSupport& support)
 {
     // Texture decoders
@@ -149,6 +151,7 @@ void CheckForPixelFormatSupport(const MetalPixelFormatSupport& support)
         // A1BGR5Unorm
         MTL_COLOR_FORMAT_TABLE[Latte::E_GX2SURFFMT::A1_B5_G5_R5_UNORM].pixelFormat = MTL::PixelFormatRGBA8Unorm;
         MTL_COLOR_FORMAT_TABLE[Latte::E_GX2SURFFMT::A1_B5_G5_R5_UNORM].isAlternateFormat = true;
+        MTL_COLOR_FORMAT_TABLE[Latte::E_GX2SURFFMT::A1_B5_G5_R5_UNORM].bytesPerBlock = 4;
         MTL_COLOR_FORMAT_TABLE[Latte::E_GX2SURFFMT::A1_B5_G5_R5_UNORM].textureDecoder = TextureDecoder_A1_B5_G5_R5_UNORM_vulkan_To_RGBA8::getInstance();
 
         // ABGR4Unorm
@@ -165,6 +168,7 @@ void CheckForPixelFormatSupport(const MetalPixelFormatSupport& support)
         // BGR5A1Unorm
         MTL_COLOR_FORMAT_TABLE[Latte::E_GX2SURFFMT::R5_G5_B5_A1_UNORM].pixelFormat = MTL::PixelFormatRGBA8Unorm;
         MTL_COLOR_FORMAT_TABLE[Latte::E_GX2SURFFMT::R5_G5_B5_A1_UNORM].isAlternateFormat = true;
+        MTL_COLOR_FORMAT_TABLE[Latte::E_GX2SURFFMT::R5_G5_B5_A1_UNORM].bytesPerBlock = 4;
         MTL_COLOR_FORMAT_TABLE[Latte::E_GX2SURFFMT::R5_G5_B5_A1_UNORM].textureDecoder = TextureDecoder_R5_G5_B5_A1_UNORM_swappedRB_To_RGBA8::getInstance();
     }
 
@@ -178,32 +182,40 @@ void CheckForPixelFormatSupport(const MetalPixelFormatSupport& support)
     if (!support.m_supportsDepth24Unorm_Stencil8)
     {
         // Depth24Unorm_Stencil8 (all Apple silicon GPUs) - swap to Depth32Float_Stencil8 like
-        // Vulkan's fallback (VulkanRenderer::GetTextureFormatInfoVK). Vulkan skips the CPU upload
-        // entirely for this fallback (TextureDecoder_NullData64 zeroes the slices), so the
-        // packed-D24S8 upload-stride question never arises - game-rendered depth is unaffected,
-        // only game-uploaded depth data reads as cleared, identical to the Vulkan reference.
-        // bytesPerBlock must describe the only copy left: the BlitOptionDepthFromDepthStencil
-        // readback, which writes the depth aspect alone (4 bytes/texel). Metal requires
-        // bytesPerRow to be a multiple of the aspect's texel size, so the old 5-byte stride
-        // (4 depth + 1 stencil) failed validation for widths not divisible by 4 (e.g. 854x480)
-        // and the copy was silently aborted - staging the stale readback content it was meant
-        // to prevent
+        // Vulkan's fallback (VulkanRenderer::GetTextureFormatInfoVK). Vulkan also skips the CPU
+        // upload for this fallback, so game-uploaded depth reads as cleared; a real D24_S8 ->
+        // D32_S8 conversion decoder would preserve it.
         MTL_DEPTH_FORMAT_TABLE[Latte::E_GX2SURFFMT::D24_S8_UNORM].pixelFormat = MTL::PixelFormatDepth32Float_Stencil8;
         MTL_DEPTH_FORMAT_TABLE[Latte::E_GX2SURFFMT::D24_S8_UNORM].isAlternateFormat = true;
-        // bytesPerBlock here describes the BlitOptionDepthFromDepthStencil readback stride (4 bytes
-        // per texel for the depth aspect alone), not the decoder's staging stride. NB:
-        // isAlternateFormat makes texture_createReadback() refuse this format outright, so the
-        // readback this value was corrected for is currently unreachable - it is kept so the stride
-        // is already right if that refusal is ever relaxed. The upload path uses the decoder below
-        // (NullData64, 8 bytes/texel), so this field carries two meanings at once and wants
-        // splitting into staging/readback strides
-        MTL_DEPTH_FORMAT_TABLE[Latte::E_GX2SURFFMT::D24_S8_UNORM].bytesPerBlock = 4;
-        // Vulkan picks TextureDecoder_NullData64 for the same fallback (VulkanRenderer), i.e. the
-        // surface reads as cleared. A real D24_S8 -> D32_S8 conversion decoder would preserve
-        // game-uploaded depth instead:
-        //MTL_DEPTH_FORMAT_TABLE[Latte::E_GX2SURFFMT::D24_S8_UNORM].textureDecoder = TextureDecoder_D24_S8_To_D32_S8::getInstance();
         MTL_DEPTH_FORMAT_TABLE[Latte::E_GX2SURFFMT::D24_S8_UNORM].textureDecoder = TextureDecoder_NullData64::getInstance();
     }
+
+    // The staging stride comes from whichever decoder ended up assigned above (NullData64 for the
+    // D24_S8_UNORM fallback, not TextureDecoder_D24_S8)
+    for (auto* table : { &MTL_COLOR_FORMAT_TABLE, &MTL_DEPTH_FORMAT_TABLE })
+    {
+        for (auto& entry : *table)
+        {
+            if (entry.second.textureDecoder)
+                entry.second.stagingBytesPerTexel = (size_t)entry.second.textureDecoder->getStagingBytesPerTexel();
+        }
+    }
+
+    // Formats with a table row but no decoder above. The shared upload path clears the texture and
+    // drops the game's data when the decoder is null (LatteTextureLoader_UpdateTextureSliceData), so
+    // list them rather than serving them as silently cleared - Vulkan reports each of these as
+    // "Unsupported color texture format"
+    std::string undecodedFormats;
+    for (const auto& [format, info] : MTL_COLOR_FORMAT_TABLE)
+    {
+        if (info.textureDecoder || format == Latte::E_GX2SURFFMT::INVALID_FORMAT)
+            continue;
+        if (!undecodedFormats.empty())
+            undecodedFormats += ", ";
+        undecodedFormats += fmt::format("{:04x}", (uint32)format);
+    }
+    if (!undecodedFormats.empty())
+        cemuLog_logOnce(LogType::Force, "Metal has no texture decoder for color formats {} - game-uploaded data is dropped and those textures stay cleared", undecodedFormats);
 }
 
 const MetalPixelFormatInfo GetMtlPixelFormatInfo(Latte::E_GX2SURFFMT format, bool isDepth)
@@ -265,6 +277,13 @@ size_t GetMtlTextureBytesPerImage(Latte::E_GX2SURFFMT format, bool isDepth, uint
     return CeilDivide(height, formatInfo.blockTexelSize.y) * bytesPerRow;
 }
 
+size_t GetMtlTextureStagingBytesPerRow(Latte::E_GX2SURFFMT format, bool isDepth, uint32 width)
+{
+    const auto& formatInfo = GetMtlPixelFormatInfo(format, isDepth);
+
+    return CeilDivide(width, formatInfo.blockTexelSize.x) * formatInfo.stagingBytesPerTexel;
+}
+
 MTL::PrimitiveType GetMtlPrimitiveType(LattePrimitiveMode primitiveMode)
 {
     switch (primitiveMode)
@@ -283,7 +302,7 @@ MTL::PrimitiveType GetMtlPrimitiveType(LattePrimitiveMode primitiveMode)
 	case Latte::LATTE_VGT_PRIMITIVE_TYPE::E_PRIMITIVE_TYPE::TRIANGLES:
 		return MTL::PrimitiveTypeTriangle;
 	case Latte::LATTE_VGT_PRIMITIVE_TYPE::E_PRIMITIVE_TYPE::TRIANGLE_FAN:
-		return MTL::PrimitiveTypeTriangleStrip;
+		return MTL::PrimitiveTypeTriangle; // fans are emulated as triangle lists (LatteIndices)
 	case Latte::LATTE_VGT_PRIMITIVE_TYPE::E_PRIMITIVE_TYPE::TRIANGLE_STRIP:
 		return MTL::PrimitiveTypeTriangleStrip;
 	case Latte::LATTE_VGT_PRIMITIVE_TYPE::E_PRIMITIVE_TYPE::QUADS:

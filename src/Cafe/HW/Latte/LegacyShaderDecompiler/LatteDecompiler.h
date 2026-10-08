@@ -148,7 +148,8 @@ struct LatteDecompilerShader
 	// texture indices, color buffer formats and depth presence into auxHash to distinguish
 	// shader variants (framebuffer-fetch MSL emission depends on them), which makes
 	// (baseHash, auxHash) unmatchable against graphic-pack shader files authored for the
-	// upstream/Vulkan hash. Pack lookups must use this field instead.
+	// upstream/Vulkan hash. Pack lookups must use this field instead. Always assigned (LatteSHRC_Calc*AuxHash on
+	// compile, LatteShader_CreateShaderFromDecompilerOutput on cache restore); 0 is a valid value.
 	uint64 packAuxHash{0};
 	// vertex shader
 	struct LatteFetchShader* compatibleFetchShader{};

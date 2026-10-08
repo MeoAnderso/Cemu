@@ -20,8 +20,8 @@
 // Hot-path cost is one relaxed atomic increment. Messages are formatted only when they will actually
 // be emitted (cemuLog_log early-outs on a disabled category).
 //
-// To add an event: append it before COUNT, add a matching row to kDescriptors in the .cpp, and add
-// an entry to the Debug -> Logging menu if it should be user-toggleable.
+// To add an event: append it before COUNT and add a matching row to kDescriptors in the .cpp. All
+// events share the MetalBackend logging category.
 
 enum class MetalDiagEvent : uint8
 {
@@ -55,7 +55,7 @@ enum class MetalDiagEvent : uint8
 	// Texture and surface handling
 	// The readback blit can only serve a 2D slice of a level the resource actually has, so a
 	// request outside that is served as the nearest expressible one. Reported because the failure
-	// mode is stale or wrong pixels the game goes on to use - a compiled-out assert used to hide it
+	// mode is stale or wrong pixels the game goes on to use
 	ReadbackShapeUnsupported,        // readback of a 3D texture, or of a mip the texture lacks
 	DepthMirrorUnavailable,          // depth-as-data read has no mirror on this backend
 	FeedbackLoopUnsupported,         // texture sampled while attached, no shadow copy possible
@@ -73,6 +73,26 @@ enum class MetalDiagEvent : uint8
 	// which Metal may reject at pipeline creation
 	OrphanOutputStripUnsupported,
 	SurfaceCopySkipped,              // a surface copy was requested but could not be performed
+	// The sampler's LOD bias cannot be applied on this backend version: MTLSamplerDescriptor.lodBias
+	// is API_AVAILABLE(macos(26.0)) only, so the bias is baked into the generated MSL by the Latte
+	// decompiler emitter - which means a shader whose source did not come from that emitter (a
+	// graphic pack shader, translated or authored MSL) and a pack lod_bias texture rule both sample
+	// at a mip the game did not ask for. Reported rather than silently diverging from Vulkan
+	SamplerLodBiasNotApplied,
+	// A samples-passed query consumed more slots than the result pool has, so its earlier slots were
+	// overwritten by its own later draws and the reported count is double-counted. Metal's query pool
+	// is consumed per draw (Vulkan acquires per query fragment and releases when the fragments finish),
+	// so this cannot be avoided the same way; the count is reported instead of being silently wrong
+	OcclusionQueryPoolWrapped,
+	// The pipeline binary archive (MetalPipelineCache::GetBinaryArchiveLookupArray) was probed with
+	// FailOnBinaryArchiveMiss, the only way a hit is observable. A run whose pipeline count is all
+	// misses means the archive is not being used at all (stale file, driver update)
+	PipelineArchiveHit,              // pipeline served from the archive, no compilation
+	PipelineArchiveMiss,             // not in the archive: compiled and added for next launch
+	// The pipeline cannot be archived at all, so it is compiled every launch: the archive's packer
+	// requires a fragment stage and rejects the whole file if an entry lacks one (see
+	// CreatePipelineStateWithArchive). Counted so "the archive stopped growing" has an explanation
+	PipelineArchiveSkipped,
 
 	COUNT
 };
@@ -123,26 +143,33 @@ bool MetalDiag_MarkFirstSighting(MetalDiagEvent event, uintptr_t key);
 //
 // This is the one idiom for "report this once per object". The latch is per key rather than per
 // event: a global per-event cap gets spent by the first hot chain, leaving the rest of the
-// session unreported. `key` is an identity - the texture object - not a value; two textures with
-// equal contents are still two keys. Counts accumulate on every call, so the session summary
-// stays exact.
+// session unreported. `key` is a stable identity such as the guest physical address, never a host
+// pointer (see MetalDiag_MarkFirstSighting). Counts accumulate on every call, so the session
+// summary stays exact.
 template <typename... TArgs>
 void MetalDiag_CountOncePer(MetalDiagEvent event, uintptr_t key,
 	fmt::format_string<TArgs...> detail, TArgs&&... args)
 {
 	MetalDiag_Record(event);
+	// The category is checked BEFORE the latch: the latch exists only to decide whether to log, so
+	// taking its mutex and inserting into its set when nothing will be emitted would put a global lock
+	// on whatever path calls this. (Counts accumulate either way - the summary stays exact.)
+	if (!cemuLog_isLoggingEnabled(LogType::MetalBackend))
+		return;
 	if (!MetalDiag_MarkFirstSighting(event, key))
 		return;
-	if (cemuLog_isLoggingEnabled(LogType::MetalBackend))
-		cemuLog_log(LogType::MetalBackend, "{}: {}", MetalDiag_GetName(event),
-			fmt::format(detail, std::forward<TArgs>(args)...));
+	cemuLog_log(LogType::MetalBackend, "{}: {}", MetalDiag_GetName(event),
+		fmt::format(detail, std::forward<TArgs>(args)...));
 }
 
 // Same, but counted once per object too: later sightings of the same key neither log nor count.
 //
 // Use this where the question is per object rather than per occurrence: "how many times was a
 // chain clamped" is a per-draw question (MetalDiag_CountOncePer), "how many chains were
-// served as written" is a per-chain one
+// served as written" is a per-chain one.
+// Unlike CountOncePer this cannot check the log category first - the latch decides the *count* here
+// as well, and that count is per object by definition. It is used only on the sampled-mip-chain path,
+// which is itself opt-in (see MetalRenderer::EnsureSampledMipContentValid)
 template <typename... TArgs>
 void MetalDiag_CountFirstSighting(MetalDiagEvent event, uintptr_t key,
 	fmt::format_string<TArgs...> detail, TArgs&&... args)
@@ -154,6 +181,12 @@ void MetalDiag_CountFirstSighting(MetalDiagEvent event, uintptr_t key,
 		cemuLog_log(LogType::MetalBackend, "{}: {}", MetalDiag_GetName(event),
 			fmt::format(detail, std::forward<TArgs>(args)...));
 }
+
+// Clears the counters and the per-object latches. Called when a renderer is constructed, so the
+// summary and the OSD describe the session the user is in: the counters are process-global, but the
+// summary is logged at title exit, and nothing else resets them - without this, a second game reports
+// the first game's numbers and its first-occurrence lines never fire
+void MetalDiag_ResetSession();
 
 // Logs the session summary at shutdown. Prints non-zero rows only, and stays silent entirely when
 // nothing was recorded, so an uneventful session does not append noise to the log.

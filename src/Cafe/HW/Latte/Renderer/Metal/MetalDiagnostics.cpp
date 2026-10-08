@@ -62,8 +62,15 @@ namespace
 		{ "sampled mip chain served with the game's own upper mip levels", nullptr },
 		{ "graphic pack shader outputs cannot be stripped for this pass (translated shader)",
 		  "this draw uses the untranslated-output function, which the pipeline may reject - the draw is then missing" },
-		{ "surface copies skipped (incompatible dimensions or bytes-per-pixel)",
+		{ "surface copies skipped (incompatible dimensions or bytes-per-pixel, or a zero-area region)",
 		  "the copied surface keeps its previous contents" },
+		{ "sampler LOD bias could not be applied",
+		  "this shader samples at a different mip level than Vulkan/OpenGL would, because Metal has no sampler LOD bias before macOS 26 and the shader's source cannot carry the baked bias" },
+		{ "samples-passed query span exceeded the result pool",
+		  "the count reported to the game for that query is inflated (its own later draws overwrote the slots its earlier draws filled)" },
+		{ "render pipelines served from the binary archive (no compilation)", nullptr },
+		{ "render pipelines compiled and added to the binary archive", nullptr },
+		{ "render pipelines not archivable (no fragment stage)", nullptr },
 	};
 
 	static_assert(std::size(kDescriptors) == (size_t)MetalDiagEvent::COUNT,
@@ -118,6 +125,14 @@ bool MetalDiag_MarkFirstSighting(MetalDiagEvent event, uintptr_t key)
 {
 	std::lock_guard<std::mutex> lock(g_firstSightingMutex);
 	return g_firstSightings.emplace((uint32)event, key).second;
+}
+
+void MetalDiag_ResetSession()
+{
+	for (size_t i = 0; i < (size_t)MetalDiagEvent::COUNT; i++)
+		g_eventCounts[i].store(0, std::memory_order_relaxed);
+	std::lock_guard<std::mutex> lock(g_firstSightingMutex);
+	g_firstSightings.clear();
 }
 
 void MetalDiag_LogSummary()
