@@ -1192,6 +1192,30 @@ void MetalRenderer::texture_setLatteTexture(LatteTextureView* textureView, uint3
     m_state.m_textures[textureUnit] = static_cast<LatteTextureViewMtl*>(textureView);
 }
 
+// Copy provenance (see LatteTextureMtl::MarkCopyMipsWritten) of a width x height copy from (srcX,srcY) of a
+// source level into (dstX,dstY) of a destination level, sizes in effective texels. Matched = level fully
+// covered from a same-sized source level, Resampled = fully covered from a differently sized one,
+// Partial = a crop (only Partial is never trusted). Both copy paths (texture_copyImageSubData and
+// surfaceCopy_viaDrawcall) classify through this, so a copy gets the same result on either path.
+// Callers scale the region to effective size before the mip shift (LatteTexture_scaleToEffectiveSize), so
+// a non-power-of-two resolution ratio can round it one texel short of the level: a level counts as
+// covered within exactly that integer-division bound, and a real crop still shows up as a non-zero offset
+static LatteTextureMtl::CopyProvenance ClassifyCopyProvenance(sint32 srcX, sint32 srcY, sint32 dstX, sint32 dstY, sint32 width, sint32 height,
+    sint32 srcLevelWidth, sint32 srcLevelHeight, sint32 dstLevelWidth, sint32 dstLevelHeight)
+{
+    using CopyProvenance = LatteTextureMtl::CopyProvenance;
+    const auto coversLevel = [width, height](sint32 levelW, sint32 levelH) {
+        return width <= levelW && height <= levelH && width >= levelW - 1 && height >= levelH - 1;
+    };
+    if (dstX != 0 || dstY != 0 || !coversLevel(dstLevelWidth, dstLevelHeight))
+        return CopyProvenance::Partial;
+    if (srcX != 0 || srcY != 0)
+        return CopyProvenance::Partial;
+    if (!coversLevel(srcLevelWidth, srcLevelHeight))
+        return CopyProvenance::Resampled;
+    return CopyProvenance::Matched;
+}
+
 void MetalRenderer::texture_copyImageSubData(LatteTexture* src, sint32 srcMip, sint32 effectiveSrcX, sint32 effectiveSrcY, sint32 srcSlice, LatteTexture* dst, sint32 dstMip, sint32 effectiveDstX, sint32 effectiveDstY, sint32 dstSlice, sint32 effectiveCopyWidth, sint32 effectiveCopyHeight, sint32 srcDepth_)
 {
     const auto srcMtlFormat = GetMtlPixelFormat(src->format, src->isDepth);
@@ -1273,30 +1297,12 @@ void MetalRenderer::texture_copyImageSubData(LatteTexture* src, sint32 srcMip, s
         }
     }
 
-    // Copy provenance (see LatteTextureMtl::MarkCopyMipsWritten), classified after the clamp above, which
-    // brings the region down to the level: Matched = level fully covered from a same-sized source level,
-    // Resampled = fully covered from a differently sized one, Partial = a crop (only Partial is never trusted)
+    // copy provenance, classified after the clamp above, which brings the region down to the level
     sint32 srcLevelWidth = 0, srcLevelHeight = 0, dstLevelWidth = 0, dstLevelHeight = 0;
     src->GetEffectiveSize(srcLevelWidth, srcLevelHeight, srcMip);
     dst->GetEffectiveSize(dstLevelWidth, dstLevelHeight, dstMip);
-    // the region is scaled to effective size before the mip shift (LatteTexture_CopySlice), so a
-    // non-power-of-two resolution ratio can round it one texel short of the level: coversLevel allows
-    // exactly that integer-division bound, and a real crop still shows up as a non-zero offset
-    const auto coversLevel = [](sint32 w, sint32 h, sint32 levelW, sint32 levelH) {
-        return w <= levelW && h <= levelH && w >= levelW - 1 && h >= levelH - 1;
-    };
-    const LatteTextureMtl::CopyProvenance copyProvenance = [&]() {
-        using CopyProvenance = LatteTextureMtl::CopyProvenance;
-        if (effectiveDstX != 0 || effectiveDstY != 0)
-            return CopyProvenance::Partial;
-        if (!coversLevel(effectiveCopyWidth, effectiveCopyHeight, dstLevelWidth, dstLevelHeight))
-            return CopyProvenance::Partial;
-        if (effectiveSrcX != 0 || effectiveSrcY != 0)
-            return CopyProvenance::Partial;
-        if (!coversLevel(effectiveCopyWidth, effectiveCopyHeight, srcLevelWidth, srcLevelHeight))
-            return CopyProvenance::Resampled;
-        return CopyProvenance::Matched;
-    }();
+    const LatteTextureMtl::CopyProvenance copyProvenance = ClassifyCopyProvenance(effectiveSrcX, effectiveSrcY, effectiveDstX, effectiveDstY,
+        effectiveCopyWidth, effectiveCopyHeight, srcLevelWidth, srcLevelHeight, dstLevelWidth, dstLevelHeight);
 
     auto blitCommandEncoder = GetBlitCommandEncoder();
 
@@ -1692,26 +1698,18 @@ void MetalRenderer::surfaceCopy_viaDrawcall(LatteTexture* sourceTexture, sint32 
 	// texture_copyImageSubData
 	auto destinationMtl = static_cast<LatteTextureMtl*>(destinationTexture);
 	destinationMtl->MarkRenderMipsWritten(dstMip, 1);
-	// and record what the copy did to that level, the same way texture_copyImageSubData does. The
-	// draw covers the region [0,0,effectiveCopyWidth,effectiveCopyHeight] of the destination level
-	// and reads the source 1:1 from its origin, so the level is a whole-level carry-over only when
-	// that region is the entire destination level. Without this, a level written here counted as
-	// "GPU written" but never as this chain's own content, which armed the sample-time clamp and the
-	// mip regeneration for any chain the game builds out of copies - a depth-to-colour effect buffer
-	// being sampled through a multi-mip view is the common case.
+	// and record what the copy did to that level, through the same classification as
+	// texture_copyImageSubData. The draw covers the region [0,0,effectiveCopyWidth,effectiveCopyHeight]
+	// of the destination level and reads the source 1:1 from its origin, so both offsets are 0. Without
+	// this, a level written here counted as "GPU written" but never as this chain's own content, which
+	// armed the sample-time clamp and the mip regeneration for any chain the game builds out of copies -
+	// a depth-to-colour effect buffer being sampled through a multi-mip view is the common case.
 	{
 		sint32 srcLevelWidth = 0, srcLevelHeight = 0, dstLevelWidth = 0, dstLevelHeight = 0;
 		sourceTexture->GetEffectiveSize(srcLevelWidth, srcLevelHeight, srcMip);
 		destinationTexture->GetEffectiveSize(dstLevelWidth, dstLevelHeight, dstMip);
-		using CopyProvenance = LatteTextureMtl::CopyProvenance;
-		CopyProvenance copyProvenance = CopyProvenance::Partial;
-		if (effectiveCopyWidth == dstLevelWidth && effectiveCopyHeight == dstLevelHeight)
-		{
-			copyProvenance = (effectiveCopyWidth == srcLevelWidth && effectiveCopyHeight == srcLevelHeight)
-				? CopyProvenance::Matched
-				: CopyProvenance::Resampled;
-		}
-		destinationMtl->MarkCopyMipsWritten(dstMip, 1, copyProvenance);
+		destinationMtl->MarkCopyMipsWritten(dstMip, 1, ClassifyCopyProvenance(0, 0, 0, 0, effectiveCopyWidth, effectiveCopyHeight,
+			srcLevelWidth, srcLevelHeight, dstLevelWidth, dstLevelHeight));
 	}
 }
 
