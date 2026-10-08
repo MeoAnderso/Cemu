@@ -400,7 +400,10 @@ int CemuApp::OnExit()
 	}
 #endif
 	wxApp::OnExit();
-	wxTheClipboard->Flush();
+	// only flush a clipboard that is actually open: wxWidgets' macOS backend asserts otherwise, and
+	// Cemu opens the clipboard only per copy, so at exit it is normally closed
+	if (wxTheClipboard && wxTheClipboard->IsOpened())
+		wxTheClipboard->Flush();
 	InputManager::instance().Shutdown();
 	int retValue = 0;
 	if (auto r = CafeSystem::GetForegroundTitleReturnStatus(); (LaunchSettings::GetLoadFile() || LaunchSettings::GetLoadTitleID()) && r)
