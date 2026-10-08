@@ -116,7 +116,8 @@ uint32 LatteIndices_calculateIndexOutputSize(LattePrimitiveMode primitiveMode, L
 	}
 	else if (primitiveMode == LattePrimitiveMode::TRIANGLE_FAN && g_renderer->GetType() == RendererAPI::Metal)
 	{
-		// emulated as a triangle list, 3 indices per fan triangle
+		// emulated as a triangle list, 3 indices per fan triangle (an upper bound: primitive restart
+		// splits the fan into shorter ones)
 		if (count < 3)
 			return 0;
 		uint32 numIndices = (count - 2) * 3;
@@ -312,24 +313,41 @@ void LatteIndices_generateAutoLineLoopIndices(void* indexDataOutput, uint32 coun
 	indexMax = std::max(count, 1u) - 1;
 }
 
-template<typename T>
-void LatteIndices_unpackTriangleFanAndConvert(const void* indexDataInput, void* indexDataOutput, uint32 count, uint32& indexMax)
+// TSrc is betype<T> or T (little-endian source). Returns the number of indices written
+template<typename TSrc, typename T>
+uint32 LatteIndices_unpackTriangleFanAndConvert(const void* indexDataInput, void* indexDataOutput, uint32 count, uint32& indexMax)
 {
-	const betype<T>* src = (betype<T>*)indexDataInput;
+	const TSrc* src = (const TSrc*)indexDataInput;
 	T* dst = (T*)indexDataOutput;
-	// triangle list in Vulkan's fan order: triangle i = (i+1, i+2, 0)
-	const T center = src[0];
-	indexMax = std::max(indexMax, (uint32)center);
-	for (uint32 i = 0; i + 2 < count; i++)
+	// triangle list in Vulkan's fan order: triangle i = (i+1, i+2, 0) of each fan. An all-ones index
+	// starts a new fan, like Vulkan's primitive restart for fans (the next index is the new center)
+	const T restartIndex = std::numeric_limits<T>::max();
+	uint32 outputCount = 0;
+	uint32 fanStart = 0;
+	while (fanStart < count)
 	{
-		T idx1 = src[i + 1];
-		T idx2 = src[i + 2];
-		indexMax = std::max(indexMax, (uint32)idx1);
-		indexMax = std::max(indexMax, (uint32)idx2);
-		dst[i * 3 + 0] = idx1;
-		dst[i * 3 + 1] = idx2;
-		dst[i * 3 + 2] = center;
+		uint32 fanEnd = fanStart;
+		while (fanEnd < count && (T)src[fanEnd] != restartIndex)
+			fanEnd++;
+		if (fanEnd - fanStart >= 3)
+		{
+			const T center = src[fanStart];
+			indexMax = std::max(indexMax, (uint32)center);
+			for (uint32 i = fanStart + 1; i + 1 < fanEnd; i++)
+			{
+				T idx1 = src[i];
+				T idx2 = src[i + 1];
+				indexMax = std::max(indexMax, (uint32)idx1);
+				indexMax = std::max(indexMax, (uint32)idx2);
+				dst[outputCount + 0] = idx1;
+				dst[outputCount + 1] = idx2;
+				dst[outputCount + 2] = center;
+				outputCount += 3;
+			}
+		}
+		fanStart = fanEnd + 1;
 	}
+	return outputCount;
 }
 
 template<typename T>
@@ -787,14 +805,22 @@ void LatteIndices_decode(const void* indexData, LatteIndexType indexType, uint32
     			LatteIndices_generateAutoTriangleFanIndices<uint32>(indexData, indexOutputPtr, count, indexMax);
     			renderIndexType = Renderer::INDEX_TYPE::U32;
     		}
+    		outputCount = (count - 2) * 3;
     	}
+    	// primitive restart can end fans early, so the indexed decoders return the count they wrote
     	else if (indexType == LatteIndexType::U16_BE)
-    		LatteIndices_unpackTriangleFanAndConvert<uint16>(indexData, indexOutputPtr, count, indexMax);
+    		outputCount = LatteIndices_unpackTriangleFanAndConvert<betype<uint16>, uint16>(indexData, indexOutputPtr, count, indexMax);
     	else if (indexType == LatteIndexType::U32_BE)
-    		LatteIndices_unpackTriangleFanAndConvert<uint32>(indexData, indexOutputPtr, count, indexMax);
+    		outputCount = LatteIndices_unpackTriangleFanAndConvert<betype<uint32>, uint32>(indexData, indexOutputPtr, count, indexMax);
+    	else if (indexType == LatteIndexType::U16_LE)
+    		outputCount = LatteIndices_unpackTriangleFanAndConvert<uint16, uint16>(indexData, indexOutputPtr, count, indexMax);
+    	else if (indexType == LatteIndexType::U32_LE)
+    	{
+    		outputCount = LatteIndices_unpackTriangleFanAndConvert<uint32, uint32>(indexData, indexOutputPtr, count, indexMax);
+    		renderIndexType = Renderer::INDEX_TYPE::U32; // the shared mapping above leaves U32_LE unset
+    	}
     	else
     		cemu_assert_debug(false);
-    	outputCount = (count - 2) * 3;
 	}
 	else
 	{

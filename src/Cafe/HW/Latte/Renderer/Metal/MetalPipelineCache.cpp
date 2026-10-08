@@ -33,8 +33,10 @@ static std::mutex s_fileCacheMutex;
 static constexpr uint32 kMaxTransientPipelineCompileAttempts = 8;
 // Version of the Metal pipeline cache file's record format, added to the shared pipeline cache version
 // (LatteShaderCache_getPipelineCacheExtraVersion, which Vulkan's file uses too). Bump it when
-// SerializePipeline/DeserializePipeline change: FileCache then recreates only the Metal file
-static constexpr uint32 kMetalPipelineCacheFormatVersion = 1;
+// SerializePipeline/DeserializePipeline change, or when the Metal-only shader hash extensions change
+// (LatteShader.cpp): entries keyed on the old hashes never match again. FileCache then recreates only the
+// Metal file. 2: mesh-path primitive mode and emulated depth-compare function in the shader hashes
+static constexpr uint32 kMetalPipelineCacheFormatVersion = 2;
 
 // Session totals maintained by MetalPipelineCompiler: every successful pipeline creation on any path
 // (the OSD's own counters exclude the async pool and the shader-cache replay, where most happen)
@@ -572,6 +574,14 @@ void MetalPipelineCache::StopCompilation()
 	StopLoaderThreads();
 }
 
+std::unique_lock<std::mutex> MetalPipelineCache::LockBinaryArchive()
+{
+    const auto waitStart = std::chrono::steady_clock::now();
+    std::unique_lock<std::mutex> lock(m_binaryArchiveMutex);
+    m_binaryArchiveLockWaitNs += (uint64)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - waitStart).count();
+    return lock;
+}
+
 // call with m_binaryArchiveMutex held
 void MetalPipelineCache::NoteBinaryArchiveAdd(uint64 vertexBaseHash, uint64 pixelBaseHash)
 {
@@ -603,7 +613,7 @@ MTL::BinaryArchive* MetalPipelineCache::EnsureBinaryArchiveWrite()
 
 bool MetalPipelineCache::AddRenderPipelineToArchive(MTL::RenderPipelineDescriptor* descriptor, uint64 vertexBaseHash, uint64 pixelBaseHash)
 {
-    std::lock_guard<std::mutex> lock(m_binaryArchiveMutex);
+    auto lock = LockBinaryArchive();
     MTL::BinaryArchive* archive = EnsureBinaryArchiveWrite();
     if (!archive)
         return false;
@@ -619,7 +629,7 @@ bool MetalPipelineCache::AddMeshRenderPipelineToArchive(MTL::MeshRenderPipelineD
     // archiving mesh pipelines needs macOS 15 (see MetalCppCompat.h)
     if (__builtin_available(macOS 15.0, *))
     {
-        std::lock_guard<std::mutex> lock(m_binaryArchiveMutex);
+        auto lock = LockBinaryArchive();
         MTL::BinaryArchive* archive = EnsureBinaryArchiveWrite();
         if (!archive)
             return false;
@@ -637,7 +647,7 @@ bool MetalPipelineCache::AddMeshRenderPipelineToArchive(MTL::MeshRenderPipelineD
 NS::Array* MetalPipelineCache::GetBinaryArchiveLookupArray()
 {
     // the array retains both archives, so it stays valid after unlocking
-    std::lock_guard<std::mutex> lock(m_binaryArchiveMutex);
+    auto lock = LockBinaryArchive();
     const NS::Object* archives[2];
     uint32 count = 0;
     if (m_binaryArchiveRead)
@@ -701,6 +711,7 @@ void MetalPipelineCache::Close()
         }
         m_binaryArchiveDirty = false;
     }
+    const uint64 archiveLockWaitNs = m_binaryArchiveLockWaitNs;
     archiveLock.unlock();
 
     // What the archive is worth, in the only unit that matters: the wall-clock time this session spent
@@ -713,7 +724,8 @@ void MetalPipelineCache::Close()
         const uint32 creationCountAtEnd = g_mtlPipelineCreationCount.load();
         const uint32 created = creationCountAtEnd - m_pipelineCreationCountAtBegin;
         const double seconds = (double)(creationTimeAtEnd - m_pipelineCreationTimeAtBegin) / 1e9;
-        cemuLog_log(LogType::Force, "Metal: this session created {} render pipelines in {:.2f} s (archive hits are counted too - they are just faster)", created, seconds);
+        cemuLog_log(LogType::Force, "Metal: this session created {} render pipelines in {:.2f} s (archive hits are counted too - they are just faster); {:.1f} ms spent waiting for the archive lock",
+            created, seconds, (double)archiveLockWaitNs / 1e6);
     }
 
     // the mutex is what makes the writer/loader threads' null checks meaningful - see s_fileCacheMutex
@@ -971,7 +983,9 @@ int MetalPipelineCache::CompilerThread()
 	while (m_numCompilationThreads != 0)
 	{
 		std::vector<uint8> pipelineData = m_compilationQueue.pop();
-		if(pipelineData.empty())
+		// re-check the stop signal: a thread that passed the loop test just before StopLoaderThreads can
+		// pop a real entry instead of a wake token, and it must be dropped like the rest of the queue
+		if (pipelineData.empty() || m_numCompilationThreads == 0)
 			continue;
 		LoadPipelineFromCache(pipelineData);
 		++g_mtlCacheState.pipelinesLoaded;

@@ -486,6 +486,10 @@ void MetalRenderer::Shutdown()
     // TODO: should shutdown both layers
     ImGui_ImplMetal_Shutdown();
     CommitCommandBuffer();
+    // a game stopped mid-frame never reaches SwapBuffers: end the pad frame here, now that its work is
+    // committed, so a GUI thread in StopUsingPadAndWait does not wait for its timeout
+    if (m_padFrameInProgress.load())
+        EndPadFrame();
     Renderer::Shutdown();
     // LatteThread_Exit frees every shader right after this returns (LatteSHRC_UnloadAll), but the pipeline
     // cache - and the compile threads that use those shaders - lives until the renderer is deleted
@@ -2935,17 +2939,21 @@ void MetalRenderer::draw_execute(uint32 baseVertex, uint32 baseInstance, uint32 
 	}
 	else
 	{
-        if (hostIndexType != INDEX_TYPE::NONE)
-       	{
-       	    auto mtlIndexType = GetMtlIndexType(hostIndexType);
-       		MarkPassAttachmentsWritten();
-      		renderCommandEncoder->drawIndexedPrimitives(mtlPrimitiveType, hostIndexCount, mtlIndexType, indexAllocationMtl->mtlBuffer, indexAllocationMtl->bufferOffset, instanceCount, baseVertex, baseInstance);
-       	}
-       	else
-       	{
-      		MarkPassAttachmentsWritten();
-      		renderCommandEncoder->drawPrimitives(mtlPrimitiveType, baseVertex, count, instanceCount, baseInstance);
-       	}
+		if (hostIndexType != INDEX_TYPE::NONE)
+		{
+			// a fan made only of restart-separated runs shorter than 3 indices decodes to no indices
+			if (hostIndexCount > 0)
+			{
+				auto mtlIndexType = GetMtlIndexType(hostIndexType);
+				MarkPassAttachmentsWritten();
+				renderCommandEncoder->drawIndexedPrimitives(mtlPrimitiveType, hostIndexCount, mtlIndexType, indexAllocationMtl->mtlBuffer, indexAllocationMtl->bufferOffset, instanceCount, baseVertex, baseInstance);
+			}
+		}
+		else
+		{
+			MarkPassAttachmentsWritten();
+			renderCommandEncoder->drawPrimitives(mtlPrimitiveType, baseVertex, count, instanceCount, baseInstance);
+		}
 	}
 
 	m_state.m_isFirstDrawInRenderPass = false;

@@ -80,6 +80,10 @@ private:
 	// guards m_binaryArchiveWrite (lazy creation), m_binaryArchiveDirty, m_binaryArchiveAddCount and every
 	// add/serialize on the write archive (MTLBinaryArchive's thread safety is undocumented)
 	std::mutex m_binaryArchiveMutex;
+	// time pipeline creation (render thread and compile threads) spent waiting for m_binaryArchiveMutex,
+	// guarded by it. Close reports it, so a session log shows whether the lock serializes pipeline creation
+	uint64 m_binaryArchiveLockWaitNs = 0;
+	std::unique_lock<std::mutex> LockBinaryArchive(); // locks m_binaryArchiveMutex and adds the wait time
 	// pipeline-creation totals at BeginLoading, so Close can report what this session spent creating
 	// pipelines - the cost the archive exists to avoid (see the declarations in MetalPipelineCompiler)
 	uint64 m_pipelineCreationTimeAtBegin = 0;
